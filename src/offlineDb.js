@@ -1,11 +1,12 @@
 
 const DB_NAME = 'quiz-arena-offline'
-const DB_VERSION = 1
+const DB_VERSION = 2
 
 const STORES = {
   quizzes: 'quizzes',
   choices: 'choices',
   results: 'results',
+  deletedQuizzes: 'deletedQuizzes',
 }
 
 function createId() {
@@ -26,41 +27,34 @@ function openDatabase() {
       const db = request.result
 
       if (!db.objectStoreNames.contains(STORES.quizzes)) {
-        const store = db.createObjectStore(STORES.quizzes, {
-          keyPath: 'localId',
-        })
+        const store = db.createObjectStore(STORES.quizzes, { keyPath: 'localId' })
         store.createIndex('ownerId', 'ownerId', { unique: false })
       }
 
       if (!db.objectStoreNames.contains(STORES.choices)) {
-        const store = db.createObjectStore(STORES.choices, {
-          keyPath: 'id',
-        })
+        const store = db.createObjectStore(STORES.choices, { keyPath: 'id' })
         store.createIndex('ownerId', 'ownerId', { unique: false })
       }
 
       if (!db.objectStoreNames.contains(STORES.results)) {
-        const store = db.createObjectStore(STORES.results, {
-          keyPath: 'localId',
-        })
+        const store = db.createObjectStore(STORES.results, { keyPath: 'localId' })
+        store.createIndex('ownerId', 'ownerId', { unique: false })
+      }
+
+      if (!db.objectStoreNames.contains(STORES.deletedQuizzes)) {
+        const store = db.createObjectStore(STORES.deletedQuizzes, { keyPath: 'quizId' })
         store.createIndex('ownerId', 'ownerId', { unique: false })
       }
     }
 
     request.onsuccess = () => {
       const db = request.result
-
       db.onversionchange = () => db.close()
       resolve(db)
     }
 
-    request.onerror = () => {
-      reject(request.error || new Error('Unable to open offline database.'))
-    }
-
-    request.onblocked = () => {
-      reject(new Error('Database upgrade is blocked. Close other Quiz Arena tabs.'))
-    }
+    request.onerror = () => reject(request.error || new Error('Unable to open offline database.'))
+    request.onblocked = () => reject(new Error('Database upgrade is blocked. Close other Quiz Arena tabs.'))
   })
 }
 
@@ -74,11 +68,8 @@ async function runTransaction(storeName, mode, operation) {
     try {
       const transaction = db.transaction(storeName, mode)
       const store = transaction.objectStore(storeName)
-
       result = operation(store)
-      request = result && typeof result === 'object' && 'result' in result
-        ? result
-        : null
+      request = result && typeof result === 'object' && 'result' in result ? result : null
 
       transaction.oncomplete = () => {
         db.close()
@@ -103,33 +94,45 @@ async function runTransaction(storeName, mode, operation) {
 
 async function getByOwner(storeName, ownerId) {
   if (!ownerId) return []
-
-  return runTransaction(storeName, 'readonly', (store) =>
-    store.index('ownerId').getAll(ownerId)
-  )
+  return runTransaction(storeName, 'readonly', (store) => store.index('ownerId').getAll(ownerId))
 }
 
-async function updateRecord(storeName, ownerId, localId, changes) {
-  if (!ownerId || !localId) return null
+async function updateRecord(storeName, ownerId, key, changes) {
+  if (!ownerId || !key) return null
 
-  const existing = await runTransaction(
-    storeName,
-    'readonly',
-    (store) => store.get(localId)
-  )
+  const existing = await runTransaction(storeName, 'readonly', (store) => store.get(key))
 
   if (!existing || existing.ownerId !== ownerId) return null
 
-  const updated = {
-    ...existing,
-    ...changes,
-  }
-
-  await runTransaction(storeName, 'readwrite', (store) =>
-    store.put(updated)
-  )
+  const updated = { ...existing, ...changes }
+  await runTransaction(storeName, 'readwrite', (store) => store.put(updated))
 
   return updated
+}
+
+// ==========================================
+// QUIZ DELETION RECORDS
+// ==========================================
+
+export async function getDeletedLocalQuizzes(ownerId) {
+  return getByOwner(STORES.deletedQuizzes, ownerId)
+}
+
+export async function isLocalQuizDeleted(ownerId, quizId) {
+  if (!ownerId || !quizId) return false
+
+  const deleted = await getDeletedLocalQuizzes(ownerId)
+
+  return deleted.some((item) =>
+    item.quizId === quizId || item.localId === quizId
+  )
+}
+
+export async function markDeletedQuizSynced(ownerId, quizId) {
+  return updateRecord(STORES.deletedQuizzes, ownerId, quizId, {
+    syncStatus: 'synced',
+    syncedAtLocal: Date.now(),
+  })
 }
 
 // ==========================================
@@ -137,13 +140,35 @@ async function updateRecord(storeName, ownerId, localId, changes) {
 // ==========================================
 
 export async function getLocalQuizzes(ownerId) {
-  return getByOwner(STORES.quizzes, ownerId)
+  const [quizzes, deleted] = await Promise.all([
+    getByOwner(STORES.quizzes, ownerId),
+    getDeletedLocalQuizzes(ownerId),
+  ])
+
+  const deletedIds = new Set(
+    deleted.flatMap((item) => [item.quizId, item.localId]).filter(Boolean)
+  )
+
+  return quizzes.filter((quiz) =>
+    !deletedIds.has(quiz.id) && !deletedIds.has(quiz.localId)
+  )
 }
 
 export async function getPendingLocalQuizzes(ownerId) {
-  const quizzes = await getLocalQuizzes(ownerId)
+  const [quizzes, deleted] = await Promise.all([
+    getByOwner(STORES.quizzes, ownerId),
+    getDeletedLocalQuizzes(ownerId),
+  ])
 
-  return quizzes.filter((quiz) => quiz.syncStatus !== 'synced')
+  const deletedIds = new Set(
+    deleted.flatMap((item) => [item.quizId, item.localId]).filter(Boolean)
+  )
+
+  return quizzes.filter((quiz) =>
+    quiz.syncStatus !== 'synced' &&
+    !deletedIds.has(quiz.id) &&
+    !deletedIds.has(quiz.localId)
+  )
 }
 
 export async function saveLocalQuiz(ownerId, quiz) {
@@ -152,6 +177,14 @@ export async function saveLocalQuiz(ownerId, quiz) {
   }
 
   const localId = quiz.localId || quiz.id || createId()
+  const quizId = quiz.id || localId
+
+  if (
+    await isLocalQuizDeleted(ownerId, quizId) ||
+    await isLocalQuizDeleted(ownerId, localId)
+  ) {
+    throw new Error('This quiz has already been permanently deleted.')
+  }
 
   const record = {
     ...quiz,
@@ -161,9 +194,7 @@ export async function saveLocalQuiz(ownerId, quiz) {
     syncStatus: quiz.syncStatus || 'pending',
   }
 
-  await runTransaction(STORES.quizzes, 'readwrite', (store) =>
-    store.put(record)
-  )
+  await runTransaction(STORES.quizzes, 'readwrite', (store) => store.put(record))
 
   return record
 }
@@ -176,8 +207,8 @@ export async function markLocalQuizSynced(ownerId, localId, cloudId) {
   })
 }
 
-export async function deleteLocalQuiz(ownerId, localId) {
-  if (!ownerId || !localId) return
+export async function deleteLocalQuiz(ownerId, localId, cloudId = localId) {
+  if (!ownerId || !localId || !cloudId) return null
 
   const existing = await runTransaction(
     STORES.quizzes,
@@ -185,11 +216,31 @@ export async function deleteLocalQuiz(ownerId, localId) {
     (store) => store.get(localId)
   )
 
-  if (!existing || existing.ownerId !== ownerId) return
+  if (existing && existing.ownerId !== ownerId) return null
 
-  await runTransaction(STORES.quizzes, 'readwrite', (store) =>
-    store.delete(localId)
+  const tombstone = {
+    quizId: cloudId,
+    localId,
+    ownerId,
+    deletedAtLocal: Date.now(),
+    syncStatus: 'pending',
+  }
+
+  await runTransaction(
+    STORES.deletedQuizzes,
+    'readwrite',
+    (store) => store.put(tombstone)
   )
+
+  if (existing?.ownerId === ownerId) {
+    await runTransaction(
+      STORES.quizzes,
+      'readwrite',
+      (store) => store.delete(localId)
+    )
+  }
+
+  return tombstone
 }
 
 // ==========================================
@@ -208,8 +259,7 @@ export async function saveLocalChoice(ownerId, label) {
   const choices = await getLocalChoices(ownerId)
 
   const existing = choices.find(
-    (choice) =>
-      choice.label.toLowerCase() === cleanLabel.toLowerCase()
+    (choice) => choice.label.toLowerCase() === cleanLabel.toLowerCase()
   )
 
   if (existing) return existing
@@ -221,8 +271,10 @@ export async function saveLocalChoice(ownerId, label) {
     createdAtLocal: Date.now(),
   }
 
-  await runTransaction(STORES.choices, 'readwrite', (store) =>
-    store.put(record)
+  await runTransaction(
+    STORES.choices,
+    'readwrite',
+    (store) => store.put(record)
   )
 
   return record
@@ -235,7 +287,6 @@ export async function saveLocalChoices(ownerId, labels) {
 
   for (const label of labels) {
     const choice = await saveLocalChoice(ownerId, label)
-
     if (choice) saved.push(choice)
   }
 
@@ -269,8 +320,10 @@ export async function saveLocalResult(ownerId, result) {
     syncStatus: result.syncStatus || 'pending',
   }
 
-  await runTransaction(STORES.results, 'readwrite', (store) =>
-    store.put(record)
+  await runTransaction(
+    STORES.results,
+    'readwrite',
+    (store) => store.put(record)
   )
 
   return record

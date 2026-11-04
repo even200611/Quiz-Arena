@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { onAuthStateChanged, signOut } from 'firebase/auth'
 import {
-  addDoc, arrayUnion, collection, deleteDoc, doc, getDoc, getDocs, limit, onSnapshot, orderBy,
+  addDoc, arrayUnion, collection, doc, getDoc, getDocs, limit, onSnapshot, orderBy,
   query, serverTimestamp, setDoc, updateDoc, where,
 } from 'firebase/firestore'
 import {
@@ -9,12 +9,12 @@ import {
   ChevronRight, CircleUserRound, Clock3, Copy, Crown, Gamepad2, Globe2,
   Home, LogOut, MessageCircle, Moon, Plus, Search, Send, ShieldCheck,
   Smile, Sparkles, Sun, Swords, Trophy, UserPlus, Users, X, RotateCcw,
-  Zap, Link2, Mail, MessageSquare, Medal, Flame, Menu, Trash2,
+  Zap, Link2, Mail, MessageSquare, Medal, Flame, Menu, Trash2, Pencil,
 } from 'lucide-react'
 import { auth, authPersistence, db } from './firebase'
 import Auth from './Auth'
 import {
-  getLocalQuizzes, saveLocalQuiz, deleteLocalQuiz,
+  getLocalQuizzes, saveLocalQuiz, deleteLocalQuiz, getDeletedLocalQuizzes, markDeletedQuizSynced, isLocalQuizDeleted,
   getLocalChoices, saveLocalChoices,
   getLocalResults, saveLocalResult,
   getPendingLocalQuizzes, getPendingLocalResults,
@@ -45,7 +45,17 @@ const initialQuizzes = [
   ] },
 ]
 const categories = ['General Knowledge', 'Science', 'Technology', 'Mathematics', 'Logic', 'Other']
-const emptyQuestion = () => ({ id: crypto.randomUUID(), type: 'multiple', question: '', options: ['', '', '', ''], correctAnswer: 0, correctText: '' })
+const emptyQuestion = () => ({ id: crypto.randomUUID(), type: 'multiple', question: '', options: ['', '', ''], correctAnswer: 0, correctText: '' })
+
+function normalizeMultipleChoice(question) {
+  const options = [...(question.options || [])]
+  let correctAnswer = Number(question.correctAnswer || 0)
+  if (options.length > 3 && correctAnswer > 2) {
+    options[2] = options[correctAnswer]
+    correctAnswer = 2
+  }
+  return { ...question, options: options.slice(0, 3), correctAnswer: Math.min(correctAnswer, 2) }
+}
 const emojis = ['😀','😂','🤣','😍','🥳','🔥','💜','💯','🎮','🏆','👏','😎','🤔','😭','👀','✨','🚀','💀','❤️','👍','🙏','🎯','🧠','⚡']
 const friendRoomId = (a, b) => `friends_${[a, b].sort().join('_')}`
 const displayName = (u) => u?.displayName || u?.email?.split('@')[0] || 'Quiz Player'
@@ -76,30 +86,6 @@ function cleanForCloud(record) {
   return data
 }
 
-// Per-account deletion tombstones prevent deleted quizzes from reappearing
-// when IndexedDB and Firebase are merged during a later login.
-function deletedQuizStorageKey(uid) {
-  return `quiz-arena-deleted-quizzes:${uid}`
-}
-function readDeletedQuizIds(uid) {
-  try {
-    const value = JSON.parse(localStorage.getItem(deletedQuizStorageKey(uid)) || '[]')
-    return new Set(Array.isArray(value) ? value : [])
-  } catch {
-    return new Set()
-  }
-}
-function writeDeletedQuizIds(uid, ids) {
-  try {
-    localStorage.setItem(deletedQuizStorageKey(uid), JSON.stringify([...ids]))
-  } catch (error) {
-    console.error('Could not save deleted quiz list:', error)
-  }
-}
-function quizIsDeleted(quiz, deletedIds) {
-  return deletedIds.has(quiz.id) || deletedIds.has(quiz.localId)
-}
-
 export default function App() {
   const [user, setUser] = useState(null)
   const [authReady, setAuthReady] = useState(false)
@@ -115,6 +101,7 @@ export default function App() {
   const [answers, setAnswers] = useState({})
   const [quizFinished, setQuizFinished] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
+  const [editingQuiz, setEditingQuiz] = useState(null)
   const [saving, setSaving] = useState(false)
   const [title, setTitle] = useState('')
   const [category, setCategory] = useState(categories[0])
@@ -124,7 +111,6 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem('quiz-arena-choice-library') || '[]') }
     catch { return [] }
   })
-  const [choiceSearch, setChoiceSearch] = useState('')
   const [identificationDraft, setIdentificationDraft] = useState('')
   const [messages, setMessages] = useState([])
   const [chatText, setChatText] = useState('')
@@ -206,18 +192,12 @@ export default function App() {
     async function loadData() {
       // Load IndexedDB first so personal content is available even without internet.
       try {
-        const [localQuizzes, localChoices, localResults] = await Promise.all([
-          getLocalQuizzes(user.uid), getLocalChoices(user.uid), getLocalResults(user.uid),
+        const [localQuizzes, localChoices, localResults, deletedQuizzes] = await Promise.all([
+          getLocalQuizzes(user.uid), getLocalChoices(user.uid), getLocalResults(user.uid), getDeletedLocalQuizzes(user.uid),
         ])
         if (cancelled) return
-        const deletedIds = readDeletedQuizIds(user.uid)
-        const availableLocalQuizzes = localQuizzes
-          .map((q) => ({ ...q, id: q.id || q.localId }))
-          .filter((q) => !quizIsDeleted(q, deletedIds))
-        setQuizzes((previous) => mergeById(
-          previous.filter((q) => !quizIsDeleted(q, deletedIds)),
-          availableLocalQuizzes,
-        ))
+        const deletedIds = new Set(deletedQuizzes.flatMap((item) => [item.quizId, item.localId]).filter(Boolean))
+        if (localQuizzes.length || deletedIds.size) setQuizzes((previous) => mergeById(previous.filter((q) => !deletedIds.has(q.id) && !deletedIds.has(q.localId)), localQuizzes.map((q) => ({ ...q, id: q.id || q.localId }))))
         if (localChoices.length) setSavedChoices((previous) => {
           const combined = [...new Set([...previous, ...localChoices.map((choice) => choice.label)])].slice(0, 150)
           try { localStorage.setItem('quiz-arena-choice-library', JSON.stringify(combined)) } catch {}
@@ -231,15 +211,11 @@ export default function App() {
 
       if (user.isLocalGuest || user.isOfflineAccount || !navigator.onLine) return
       try {
-        const snapshot = await getDocs(query(collection(db, 'quizzes'), where('createdBy', '==', user.uid)))
-        const deletedIds = readDeletedQuizIds(user.uid)
-        const saved = snapshot.docs
-          .map((item) => ({ id: item.id, ...item.data() }))
-          .filter((q) => !quizIsDeleted(q, deletedIds))
-        if (!cancelled) setQuizzes((previous) => {
-          const kept = previous.filter((q) => !quizIsDeleted(q, deletedIds))
-          return mergeById(saved, [...kept, ...initialQuizzes])
-        })
+        const snapshot = await getDocs(collection(db, 'quizzes'))
+        const deletedQuizzes = await getDeletedLocalQuizzes(user.uid)
+        const deletedIds = new Set(deletedQuizzes.flatMap((item) => [item.quizId, item.localId]).filter(Boolean))
+        const saved = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter((item) => !item.deleted && !deletedIds.has(item.id) && !deletedIds.has(item.localId))
+        if (!cancelled) setQuizzes((previous) => mergeById(saved, [...previous.filter((item) => !deletedIds.has(item.id) && !deletedIds.has(item.localId)), ...initialQuizzes]))
       } catch (error) {
         console.error('Could not load cloud quizzes:', error)
         if (!cancelled) setNotice('Offline mode: showing quizzes saved on this device.')
@@ -258,24 +234,34 @@ export default function App() {
     let cancelled = false
     async function syncOfflineData() {
       try {
-        const deletedIds = readDeletedQuizIds(user.uid)
-        // Retry cloud deletion for quizzes removed while this device was offline.
-        for (const deletedId of deletedIds) {
-          if (cancelled) return
-          if (deletedId) {
-            try { await deleteDoc(doc(db, 'quizzes', deletedId)) }
-            catch (error) { console.warn('Pending quiz deletion will retry:', deletedId, error) }
-          }
-        }
-        const [pendingQuizzes, pendingResults] = await Promise.all([
-          getPendingLocalQuizzes(user.uid), getPendingLocalResults(user.uid),
+        const [deletedQuizzes, pendingQuizzes, pendingResults] = await Promise.all([
+          getDeletedLocalQuizzes(user.uid), getPendingLocalQuizzes(user.uid), getPendingLocalResults(user.uid),
         ])
-        for (const quiz of pendingQuizzes) {
-          if (deletedIds.has(quiz.localId) || deletedIds.has(quiz.id)) continue
+        // Push deletion tombstones first. A deleted quiz must never be uploaded again.
+        for (const deleted of deletedQuizzes) {
           if (cancelled) return
+          await setDoc(doc(db, 'quizzes', deleted.quizId), {
+            deleted: true,
+            deletedBy: user.uid,
+            localId: deleted.localId || deleted.quizId,
+            deletedAt: serverTimestamp(),
+          }, { merge: true })
+          await markDeletedQuizSynced(user.uid, deleted.quizId)
+        }
+        for (const quiz of pendingQuizzes) {
+          if (cancelled) return
+          const quizCloudId = quiz.id || quiz.localId
+          if (await isLocalQuizDeleted(user.uid, quizCloudId) || await isLocalQuizDeleted(user.uid, quiz.localId)) continue
           const cloudQuiz = cleanForCloud(quiz)
-          await setDoc(doc(db, 'quizzes', quiz.localId), { ...cloudQuiz, localId: quiz.localId, syncStatus: 'synced', createdAt: serverTimestamp() })
+          await setDoc(doc(db, 'quizzes', quizCloudId), { ...cloudQuiz, localId: quiz.localId, deleted: false, syncStatus: 'synced', createdAt: serverTimestamp() })
           await markLocalQuizSynced(user.uid, quiz.localId)
+          // Re-check after upload to close the race where deletion happens during a sync.
+          if (await isLocalQuizDeleted(user.uid, quizCloudId) || await isLocalQuizDeleted(user.uid, quiz.localId)) {
+            await setDoc(doc(db, 'quizzes', quizCloudId), {
+              deleted: true, deletedBy: user.uid, localId: quiz.localId, deletedAt: serverTimestamp(),
+            }, { merge: true })
+            await markDeletedQuizSynced(user.uid, quizCloudId)
+          }
         }
         for (const result of pendingResults) {
           if (cancelled) return
@@ -283,7 +269,7 @@ export default function App() {
           await setDoc(doc(db, 'quiz_results', result.localId), { ...cloudResult, localId: result.localId, syncStatus: 'synced', createdAt: serverTimestamp() })
           await markLocalResultSynced(user.uid, result.localId)
         }
-        if (pendingQuizzes.length || pendingResults.length) setNotice('Offline data synced with Firebase!')
+        if (deletedQuizzes.length || pendingQuizzes.length || pendingResults.length) setNotice('Offline data synced with Firebase!')
       } catch (error) {
         console.error('Offline sync:', error)
         if (!cancelled) setNotice('Some offline data is still waiting to sync.')
@@ -394,10 +380,8 @@ export default function App() {
   const field = isDark ? 'border-white/10 bg-[#111b24] text-slate-100 placeholder:text-slate-500' : 'border-slate-300 bg-white text-slate-900 placeholder:text-slate-400'
   const buttonPrimary = 'inline-flex items-center justify-center rounded-xl bg-gradient-to-r from-teal-600 to-cyan-700 px-4 py-2.5 font-bold text-white shadow-lg shadow-teal-950/30 transition hover:-translate-y-0.5 hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50'
   const buttonSecondary = `inline-flex items-center justify-center rounded-xl border px-4 py-2.5 font-semibold transition ${isDark ? 'border-white/10 bg-white/[0.03] hover:bg-white/[0.08]' : 'border-slate-300 bg-white hover:bg-slate-100'}`
-  const deletedQuizIds = user ? readDeletedQuizIds(user.uid) : new Set()
-  const availableQuizzes = quizzes.filter((quiz) => !quizIsDeleted(quiz, deletedQuizIds))
-  const myQuizzes = availableQuizzes.filter((quiz) => quiz.createdBy && quiz.createdBy === user?.uid)
-  const visibleQuizzes = availableQuizzes.filter((quiz) => {
+  const myQuizzes = quizzes.filter((quiz) => quiz.createdBy && quiz.createdBy === user?.uid)
+  const visibleQuizzes = quizzes.filter((quiz) => {
     const matches = quiz.title?.toLowerCase().includes(search.toLowerCase()) || quiz.category?.toLowerCase().includes(search.toLowerCase())
     return activeTab === 'My Quizzes' ? quiz.createdBy === user?.uid && matches : matches
   })
@@ -457,47 +441,62 @@ export default function App() {
     setNotice('Game invitation declined.')
   }
 
+  function editQuiz(quiz) {
+    if (!user || quiz.createdBy !== user.uid) return setNotice('You can only edit quizzes you created.')
+    setEditingQuiz(quiz)
+    setTitle(quiz.title || '')
+    setCategory(quiz.category || categories[0])
+    setDifficulty(quiz.difficulty || 'Easy')
+    setNewQuestions((quiz.questions || []).map((question) => ({
+      id: question.id || crypto.randomUUID(),
+      type: question.type || 'multiple',
+      question: question.question || '',
+      options: question.type === 'identification' ? [] : question.type === 'boolean' ? ['True', 'False'] : normalizeMultipleChoice(question).options,
+      correctAnswer: question.type === 'multiple' ? normalizeMultipleChoice(question).correctAnswer : Number(question.correctAnswer || 0),
+      correctText: question.correctText || '',
+    })))
+    setShowCreate(true)
+    setActiveTab('My Quizzes')
+  }
+
+  function closeQuizCreator() {
+    setShowCreate(false)
+    setEditingQuiz(null)
+    setTitle('')
+    setCategory(categories[0])
+    setDifficulty('Easy')
+    setNewQuestions([emptyQuestion()])
+  }
+
   async function deleteQuiz(quiz) {
-    if (!user || quiz.createdBy !== user.uid) {
-      return setNotice('You can only delete quizzes you created.')
-    }
+    if (!user || quiz.createdBy !== user.uid) return setNotice('You can only delete quizzes you created.')
     if (!window.confirm(`Delete “${quiz.title}”? This cannot be undone.`)) return
-
-    const quizId = quiz.id
-    const localId = quiz.localId || quiz.id
-    const deletedIds = readDeletedQuizIds(user.uid)
-    // Save the tombstone before touching storage/network so the quiz cannot
-    // flash back into the UI if a later delete or network request fails.
-    deletedIds.add(quizId)
-    deletedIds.add(localId)
-    writeDeletedQuizIds(user.uid, deletedIds)
-    setQuizzes((previous) => previous.filter(
-      (item) => item.id !== quizId && item.localId !== localId
-    ))
-
-    let localDeleteSucceeded = false
-    let cloudDeleteSucceeded = !navigator.onLine || user.isLocalGuest || user.isOfflineAccount
     try {
-      await deleteLocalQuiz(user.uid, localId)
-      localDeleteSucceeded = true
-    } catch (error) {
-      console.error('Local quiz delete:', error)
-    }
-
-    if (navigator.onLine && !user.isLocalGuest && !user.isOfflineAccount) {
-      try {
-        await deleteDoc(doc(db, 'quizzes', quizId))
-        cloudDeleteSucceeded = true
-      } catch (error) {
-        console.error('Cloud quiz delete:', error)
-        cloudDeleteSucceeded = false
+      const localId = quiz.localId || quiz.id
+      const quizCloudId = quiz.id || localId
+      await deleteLocalQuiz(user.uid, localId, quizCloudId)
+      // Remove it from the screen immediately; the local tombstone remains even if cloud is offline.
+      setQuizzes((previous) => previous.filter((item) => item.id !== quiz.id && item.localId !== localId))
+      if (navigator.onLine && !user.isLocalGuest && !user.isOfflineAccount) {
+        try {
+          await setDoc(doc(db, 'quizzes', quizCloudId), {
+            deleted: true,
+            deletedBy: user.uid,
+            localId,
+            deletedAt: serverTimestamp(),
+          }, { merge: true })
+          await markDeletedQuizSynced(user.uid, quizCloudId)
+          setNotice('Quiz permanently deleted and deletion synced with Firebase.')
+        } catch (cloudError) {
+          console.error('Quiz deletion cloud sync:', cloudError)
+          setNotice('Quiz deleted on this device. Cloud deletion is waiting to sync; check Firestore permissions.')
+        }
+      } else {
+        setNotice('Quiz deleted locally. Deletion will sync when internet returns.')
       }
-    }
-
-    if (localDeleteSucceeded && cloudDeleteSucceeded) {
-      setNotice('Quiz permanently removed from this account and device.')
-    } else {
-      setNotice('Quiz hidden and deletion saved. Any remaining cloud copy will be removed when sync succeeds.')
+    } catch (error) {
+      console.error('Delete quiz:', error)
+      setNotice('Could not delete this quiz. Please try again.')
     }
   }
 
@@ -551,10 +550,24 @@ export default function App() {
   function updateOption(questionIndex, optionIndex, value) {
     setNewQuestions((previous) => previous.map((q, index) => {
       if (index !== questionIndex) return q
-      const options = [...q.options]
+      const options = [...(q.options || [])]
       options[optionIndex] = value
       return { ...q, options }
     }))
+    // Save each non-empty choice immediately so it is reusable offline and later.
+    if (String(value ?? '').trim()) rememberChoices([value])
+  }
+
+  function getPreviousChoices(questionIndex) {
+    const earlierQuestionChoices = newQuestions
+      .slice(0, questionIndex)
+      .filter((question) => question.type === 'multiple')
+      .flatMap((question) => question.options || [])
+
+    return [...new Set([
+      ...earlierQuestionChoices,
+      ...savedChoices,
+    ].map((choice) => String(choice ?? '').trim()).filter(Boolean))].slice(0, 150)
   }
 
   function changeQuestionType(questionIndex, type) {
@@ -562,7 +575,7 @@ export default function App() {
       if (index !== questionIndex) return q
       if (type === 'boolean') return { ...q, type, options: ['True', 'False'], correctAnswer: 0, correctText: '' }
       if (type === 'identification') return { ...q, type, options: [], correctAnswer: 0, correctText: '' }
-      return { ...q, type: 'multiple', options: ['', '', '', ''], correctAnswer: 0, correctText: '' }
+      return { ...q, type: 'multiple', options: ['', '', ''], correctAnswer: 0, correctText: '' }
     }))
   }
 
@@ -580,35 +593,52 @@ export default function App() {
     event.preventDefault()
     if (!title.trim()) return setNotice('Please enter a quiz title.')
     const valid = newQuestions.every((q) => q.question.trim() && (
-      q.type === 'identification' ? q.correctText.trim() : q.options.length && q.options.every((o) => o.trim())
+      q.type === 'identification' ? q.correctText.trim() : q.type === 'multiple' ? q.options.length === 3 && q.options.every((o) => o.trim()) : q.options.length === 2 && q.options.every((o) => o.trim())
     ))
     if (!valid) return setNotice('Complete every question and its correct answer or choices.')
     setSaving(true)
     const preparedQuestions = newQuestions.map((q) => ({
       type: q.type || 'multiple',
       question: q.question.trim(),
-      options: q.type === 'identification' ? [] : q.options.map((o) => o.trim()),
-      correctAnswer: Number(q.correctAnswer || 0),
+      options: q.type === 'identification' ? [] : q.type === 'multiple' ? q.options.slice(0, 3).map((o) => o.trim()) : ['True', 'False'],
+      correctAnswer: q.type === 'multiple' ? Math.min(Number(q.correctAnswer || 0), 2) : Number(q.correctAnswer || 0),
       ...(q.type === 'identification' ? { correctText: q.correctText.trim() } : {}),
     }))
-    const localId = `local_${crypto.randomUUID()}`
-    const quizData = { id: localId, localId, title: title.trim(), category, difficulty, questions: preparedQuestions, createdBy: user.uid, creatorName: userName, privacy: 'invite', allowedUserIds: [user.uid], createdAtLocal: Date.now(), syncStatus: 'pending' }
+    const isEditing = Boolean(editingQuiz)
+    const localId = isEditing ? (editingQuiz.localId || editingQuiz.id) : `local_${crypto.randomUUID()}`
+    const quizId = isEditing ? editingQuiz.id : localId
+    const quizData = {
+      ...(isEditing ? editingQuiz : {}),
+      id: quizId, localId, title: title.trim(), category, difficulty,
+      questions: preparedQuestions, createdBy: user.uid, creatorName: userName,
+      privacy: editingQuiz?.privacy || 'invite',
+      allowedUserIds: editingQuiz?.allowedUserIds || [user.uid],
+      createdAtLocal: editingQuiz?.createdAtLocal || Date.now(),
+      updatedAtLocal: Date.now(), syncStatus: 'pending',
+    }
     try {
       newQuestions.filter((q) => q.type === 'multiple').forEach((q) => rememberChoices(q.options))
       const localSaved = await saveLocalQuiz(user.uid, quizData)
-      setQuizzes((previous) => [localSaved, ...previous.filter((item) => item.id !== localId)])
+      setQuizzes((previous) => isEditing
+        ? previous.map((item) => item.id === quizId || item.localId === localId ? { ...item, ...localSaved, id: quizId, localId } : item)
+        : [localSaved, ...previous.filter((item) => item.id !== localId)])
       let synced = false
       if (navigator.onLine && !user.isLocalGuest && !user.isOfflineAccount) {
         try {
-          await setDoc(doc(db, 'quizzes', localId), { title: quizData.title, category, difficulty, questions: preparedQuestions, createdBy: user.uid, creatorName: userName, privacy: 'invite', allowedUserIds: [user.uid], localId, syncStatus: 'synced', createdAt: serverTimestamp() })
+          await setDoc(doc(db, 'quizzes', quizId), {
+            title: quizData.title, category, difficulty, questions: preparedQuestions,
+            createdBy: user.uid, creatorName: userName, privacy: quizData.privacy,
+            allowedUserIds: quizData.allowedUserIds, localId, syncStatus: 'synced',
+            createdAt: editingQuiz?.createdAt || serverTimestamp(), updatedAt: serverTimestamp(),
+          }, { merge: true })
           await markLocalQuizSynced(user.uid, localId)
           synced = true
-        } catch (cloudError) {
-          console.error('Quiz cloud sync:', cloudError)
-        }
+        } catch (cloudError) { console.error('Quiz cloud sync:', cloudError) }
       }
-      setTitle(''); setCategory(categories[0]); setDifficulty('Easy'); setNewQuestions([emptyQuestion()]); setChoiceSearch(''); setShowCreate(false); setActiveTab('My Quizzes')
-      setNotice(synced ? 'Quiz created and synced with Firebase!' : user.isLocalGuest ? 'Quiz saved on this device in Guest Mode!' : user.isOfflineAccount ? 'Quiz saved locally under your account!'  : 'Quiz saved on this device. It will sync when internet returns.')
+      setTitle(''); setCategory(categories[0]); setDifficulty('Easy'); setNewQuestions([emptyQuestion()]); setEditingQuiz(null); setShowCreate(false); setActiveTab('My Quizzes')
+      setNotice(isEditing
+        ? synced ? 'Quiz changes saved and synced!' : 'Quiz changes saved on this device. They will sync when internet returns.'
+        : synced ? 'Quiz created and synced with Firebase!' : user.isLocalGuest ? 'Quiz saved on this device in Guest Mode!' : user.isOfflineAccount ? 'Quiz saved locally under your account!' : 'Quiz saved on this device. It will sync when internet returns.')
     } catch (error) { console.error(error); setNotice('Could not save quiz to this device. Check browser storage permissions.') }
     finally { setSaving(false) }
   }
@@ -807,7 +837,7 @@ export default function App() {
         <div className={`${panel} mt-5 rounded-2xl p-5`}><h3 className="mb-3 font-black">How it works</h3><div className="grid gap-4 sm:grid-cols-3">{[{ n:'01', title:'Create a link', desc:'Generate a unique invitation.' },{ n:'02', title:'Share it', desc:'Send the link to your friend.' },{ n:'03', title:'Connect & chat', desc:'Accept to unlock private chat.' }].map((item) => <div key={item.n} className="rounded-xl bg-white/[0.03] p-4"><p className="mb-2 text-xs font-black text-teal-300">{item.n}</p><p className="mb-1 font-bold">{item.title}</p><p className={`text-sm ${muted}`}>{item.desc}</p></div>)}</div></div></section>}
 
       {(activeTab === 'Overview' || activeTab === 'Explore Quizzes' || activeTab === 'My Quizzes') && <section><div className="mb-5 flex flex-wrap items-end justify-between gap-4"><div><h2 className="text-xl font-black">{activeTab === 'My Quizzes' ? 'Your creations' : activeTab === 'Explore Quizzes' ? 'Explore challenges' : 'Popular challenges'}</h2><p className={`mt-1 text-sm ${muted}`}>Pick a challenge and prove your skills.</p></div><div className="relative w-full sm:w-72"><Search className={`absolute left-3 top-1/2 -translate-y-1/2 ${muted}`} size={18} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search quizzes..." className={`w-full rounded-xl border py-3 pl-10 pr-4 outline-none focus:border-teal-500 ${field}`} /></div></div>
-        {visibleQuizzes.length === 0 ? <div className={`${panel} rounded-2xl p-10 text-center`}><BookOpen className={`mx-auto mb-3 ${muted}`} size={36} /><h3 className="mb-2 text-lg font-black">No quizzes found</h3><p className={`mb-5 text-sm ${muted}`}>Try another search or create a challenge.</p><button className={buttonPrimary} onClick={() => setShowCreate(true)}><Plus className="mr-1" size={18} /> Create Quiz</button></div> : <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{visibleQuizzes.map((quiz, index) => <article key={quiz.id} className={`${panel} group overflow-hidden rounded-2xl transition duration-300 hover:-translate-y-1 hover:border-teal-400/30`}><div className={`relative flex h-32 items-center justify-center overflow-hidden ${index % 3 === 0 ? 'bg-gradient-to-br from-teal-800 to-slate-700' : index % 3 === 1 ? 'bg-gradient-to-br from-cyan-800 to-teal-700' : 'bg-gradient-to-br from-slate-700 to-sky-800'}`}><div className="absolute -right-3 -top-7 rotate-12 text-white/10 transition group-hover:scale-110"><Gamepad2 size={120} /></div><BookOpen size={43} className="relative text-white drop-shadow-lg transition group-hover:scale-110" /><span className="absolute right-3 top-3 rounded-full border border-white/20 bg-black/15 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-white">{quiz.difficulty || 'Custom'}</span></div><div className="p-5"><span className="mb-3 inline-flex rounded-full bg-teal-500/15 px-3 py-1 text-xs font-bold text-teal-300">{quiz.category || 'General'}</span><h3 className="mb-2 text-lg font-black">{quiz.title}</h3><p className={`mb-5 flex items-center gap-2 text-sm ${muted}`}><BookOpen size={16} /> {quiz.questions?.length || 0} questions <span>·</span><Clock3 size={16} /> {Math.max(1, Math.ceil((quiz.questions?.length || 0) * .5))} min</p><div className="flex gap-2"><button onClick={() => startQuiz(quiz)} className={`${buttonPrimary} min-w-0 flex-1`}>Enter challenge <ChevronRight className="ml-1" size={18} /></button>{quiz.createdBy === user.uid && <button onClick={() => deleteQuiz(quiz)} className={`${buttonSecondary} border-rose-500/25 px-3 text-rose-400 hover:bg-rose-500/10`} title="Delete my quiz" aria-label={`Delete ${quiz.title}`}><Trash2 size={17} /></button>}</div></div></article>)}</div>}</section>}
+        {visibleQuizzes.length === 0 ? <div className={`${panel} rounded-2xl p-10 text-center`}><BookOpen className={`mx-auto mb-3 ${muted}`} size={36} /><h3 className="mb-2 text-lg font-black">No quizzes found</h3><p className={`mb-5 text-sm ${muted}`}>Try another search or create a challenge.</p><button className={buttonPrimary} onClick={() => { closeQuizCreator(); setShowCreate(true) }}><Plus className="mr-1" size={18} /> Create Quiz</button></div> : <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{visibleQuizzes.map((quiz, index) => <article key={quiz.id} className={`${panel} group overflow-hidden rounded-2xl transition duration-300 hover:-translate-y-1 hover:border-teal-400/30`}><div className={`relative flex h-32 items-center justify-center overflow-hidden ${index % 3 === 0 ? 'bg-gradient-to-br from-teal-800 to-slate-700' : index % 3 === 1 ? 'bg-gradient-to-br from-cyan-800 to-teal-700' : 'bg-gradient-to-br from-slate-700 to-sky-800'}`}><div className="absolute -right-3 -top-7 rotate-12 text-white/10 transition group-hover:scale-110"><Gamepad2 size={120} /></div><BookOpen size={43} className="relative text-white drop-shadow-lg transition group-hover:scale-110" /><span className="absolute right-3 top-3 rounded-full border border-white/20 bg-black/15 px-2.5 py-1 text-[10px] font-black uppercase tracking-wider text-white">{quiz.difficulty || 'Custom'}</span></div><div className="p-5"><span className="mb-3 inline-flex rounded-full bg-teal-500/15 px-3 py-1 text-xs font-bold text-teal-300">{quiz.category || 'General'}</span><h3 className="mb-2 text-lg font-black">{quiz.title}</h3><p className={`mb-5 flex items-center gap-2 text-sm ${muted}`}><BookOpen size={16} /> {quiz.questions?.length || 0} questions <span>·</span><Clock3 size={16} /> {Math.max(1, Math.ceil((quiz.questions?.length || 0) * .5))} min</p><div className="flex gap-2"><button onClick={() => startQuiz(quiz)} className={`${buttonPrimary} min-w-0 flex-1`}>Enter challenge <ChevronRight className="ml-1" size={18} /></button>{quiz.createdBy === user.uid && <><button onClick={() => editQuiz(quiz)} className={`${buttonSecondary} border-cyan-400/25 px-3 text-cyan-300 hover:bg-cyan-500/10`} title="Edit my quiz" aria-label={`Edit ${quiz.title}`}><Pencil size={17} /></button><button onClick={() => deleteQuiz(quiz)} className={`${buttonSecondary} border-rose-500/25 px-3 text-rose-400 hover:bg-rose-500/10`} title="Delete my quiz" aria-label={`Delete ${quiz.title}`}><Trash2 size={17} /></button></>}</div></div></article>)}</div>}</section>}
 
       {(activeTab === 'Overview' || activeTab === 'Explore Quizzes' || activeTab === 'My Quizzes') && <section className={`${panel} mt-8 rounded-2xl p-5`}><div className="mb-4 flex items-center justify-between"><h2 className="font-black">Recent runs</h2><button onClick={() => setActiveTab('Leaderboard')} className="text-xs font-bold text-teal-300 hover:text-teal-200">View leaderboard <ChevronRight className="ml-1 inline" size={14} /></button></div>{myResults.length === 0 ? <p className={`text-sm ${muted}`}>No results yet. Choose a quiz above and start your first run.</p> : <div className="space-y-3">{myResults.slice(0, 5).map((result) => <div key={result.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-white/[0.025] p-3"><div><p className="font-semibold">{result.quizTitle}</p><p className={`text-xs ${muted}`}>{result.totalQuestions} questions</p></div><span className="rounded-xl bg-teal-500/15 px-3 py-2 font-black text-teal-300">{result.score}/{result.totalQuestions}</span></div>)}</div>}</section>}
       <footer className={`mt-8 flex flex-wrap items-center justify-center gap-2 text-center text-xs ${muted}`}><Gamepad2 size={15} /> Quiz Arena <span>·</span> Learn, play, improve <span>·</span><span className="text-teal-300">GG, have fun!</span></footer>
@@ -816,16 +846,16 @@ export default function App() {
     {pendingGameRoom && <div className="fixed inset-0 z-[55] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"><div className={`${panel} w-full max-w-md rounded-3xl p-6`}><div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-teal-500/15 text-teal-300"><Gamepad2 size={28} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-teal-300">Game invitation</p><h2 className="mb-2 text-2xl font-black">Join {pendingGameRoom.quiz?.title || 'this quiz'}?</h2><p className={`mb-5 text-sm ${muted}`}>Invited by {pendingGameRoom.creatorName || 'a Quiz Arena player'}. There {pendingGameRoom.players?.length === 1 ? 'is' : 'are'} {pendingGameRoom.players?.length || 1} player{(pendingGameRoom.players?.length || 1) === 1 ? '' : 's'} in this room. Accept to join the player list and access the live game chat.</p><div className="mb-5 flex flex-wrap gap-2">{(pendingGameRoom.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === pendingGameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap justify-end gap-3"><button onClick={declineGameInvitation} disabled={joiningGame} className={buttonSecondary}>Decline</button><button onClick={acceptGameInvitation} disabled={joiningGame} className={buttonPrimary}>{joiningGame ? 'Joining...' : 'Accept & join game'} <ChevronRight className="ml-1" size={17} /></button></div></div></div>}
 
     {showCreate && <div className="fixed inset-0 z-50 overflow-y-auto bg-black/80 p-3 backdrop-blur-md sm:p-6"><div className={`${panel} mx-auto my-4 max-w-4xl rounded-3xl p-5 sm:my-8 sm:p-7`}>
-      <div className="mb-7 flex items-start justify-between gap-4"><div><div className="mb-3 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-black uppercase tracking-wider text-cyan-300"><Sparkles size={14} /> Quiz Creator Studio</div><h2 className="text-3xl font-black">Build your challenge</h2><p className={`mt-2 text-sm ${muted}`}>Create your own questions and choose the answer format.</p></div><button type="button" onClick={() => setShowCreate(false)} className={`rounded-xl p-2 ${muted} hover:bg-white/10`}><X size={22} /></button></div>
-      <form onSubmit={createQuiz} className="space-y-6"><div className="grid gap-4 sm:grid-cols-2"><div className="sm:col-span-2"><label className="mb-2 block text-sm font-bold">Quiz title</label><input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Ultimate IT Knowledge Challenge" maxLength={100} required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /></div><div><label className="mb-2 block text-sm font-bold">Category</label><select value={category} onChange={(e) => setCategory(e.target.value)} className={`w-full rounded-xl border px-4 py-3 ${field}`}>{categories.map((item) => <option key={item}>{item}</option>)}</select></div><div><label className="mb-2 block text-sm font-bold">Difficulty</label><select value={difficulty} onChange={(e) => setDifficulty(e.target.value)} className={`w-full rounded-xl border px-4 py-3 ${field}`}>{['Easy','Medium','Hard'].map((item) => <option key={item}>{item}</option>)}</select></div></div>
-      <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-black">Questions</h3><p className={`text-xs ${muted}`}>{newQuestions.length} question(s) added</p></div><button type="button" onClick={() => setNewQuestions((prev) => [...prev, emptyQuestion()])} className={buttonPrimary}><Plus size={17} className="mr-1" /> Add question</button></div>
+      <div className="mb-7 flex items-start justify-between gap-4"><div><div className="mb-3 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-black uppercase tracking-wider text-cyan-300"><Sparkles size={14} /> Quiz Creator Studio</div><h2 className="text-3xl font-black">{editingQuiz ? 'Edit your challenge' : 'Build your challenge'}</h2><p className={`mt-2 text-sm ${muted}`}>Create your own questions and choose the answer format.</p></div><button type="button" onClick={closeQuizCreator} className={`rounded-xl p-2 ${muted} hover:bg-white/10`}><X size={22} /></button></div>
+      <form onSubmit={createQuiz} className="space-y-6"><div className="grid gap-4 sm:grid-cols-2"><div className="sm:col-span-2"><label className="mb-2 block text-sm font-bold">Quiz title</label><input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Ultimate IT Knowledge Challenge" maxLength={100} required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /></div></div>
+      <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-black">Questions</h3><p className={`text-xs ${muted}`}>{newQuestions.length} question(s) added</p></div></div>
       {newQuestions.map((q, qi) => <div key={q.id || qi} className="rounded-2xl border border-cyan-400/20 bg-gradient-to-br from-cyan-500/[0.07] to-violet-500/[0.04] p-4 sm:p-5"><div className="mb-4 flex items-center justify-between gap-3"><div className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-500 to-violet-600 font-black text-white">{String(qi + 1).padStart(2, '0')}</span><div><h4 className="font-black">Question {qi + 1}</h4><p className={`text-xs ${muted}`}>Choose question format</p></div></div>{newQuestions.length > 1 && <button type="button" onClick={() => setNewQuestions((prev) => prev.filter((_, i) => i !== qi))} className="rounded-lg p-2 text-rose-400 hover:bg-rose-500/10"><Trash2 size={18} /></button>}</div>
       <textarea value={q.question} onChange={(e) => updateQuestion(qi, 'question', e.target.value)} placeholder="Type your question here..." rows={2} required className={`mb-4 w-full resize-y rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} />
       <label className="mb-2 block text-sm font-bold">Question type</label><div className="mb-5 grid grid-cols-3 gap-2">{[{value:'multiple',label:'Multiple Choice'},{value:'boolean',label:'True / False'},{value:'identification',label:'Identification'}].map((item) => <button key={item.value} type="button" onClick={() => changeQuestionType(qi, item.value)} className={`rounded-xl border px-2 py-3 text-xs font-black transition sm:text-sm ${q.type === item.value ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300' : 'border-white/10 bg-white/[0.03] hover:border-cyan-400/50'}`}>{item.label}</button>)}</div>
-      {q.type === 'identification' ? <div><label className="mb-2 block text-sm font-bold">Correct answer</label><input value={q.correctText} onChange={(e) => updateQuestion(qi, 'correctText', e.target.value)} placeholder="Enter the exact correct answer" required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /><p className={`mt-2 text-xs ${muted}`}>Answers are checked without case sensitivity and ignore extra spaces.</p></div> : <><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold">{q.type === 'boolean' ? 'Select the correct answer' : 'Answer choices'}</p>{q.type === 'multiple' && <span className="text-xs text-cyan-300">Pick the correct option</span>}</div><div className="space-y-3">{q.options.map((option, oi) => <div key={oi} className="grid grid-cols-[40px_minmax(0,1fr)] gap-2 sm:grid-cols-[40px_minmax(0,1fr)_190px]"><button type="button" onClick={() => updateQuestion(qi, 'correctAnswer', oi)} className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl border font-black ${q.correctAnswer === oi ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300' : 'border-white/10 bg-white/[0.03] text-slate-400'}`} title="Mark as correct answer">{q.correctAnswer === oi ? <Check size={18} /> : String.fromCharCode(65 + oi)}</button><input value={option} onChange={(e) => updateOption(qi, oi, e.target.value)} placeholder={q.type === 'boolean' ? option : `Enter choice ${String.fromCharCode(65 + oi)}`} readOnly={q.type === 'boolean'} required className={`min-w-0 w-full rounded-xl border px-3 py-3 outline-none focus:border-cyan-400 ${field} ${q.type === 'boolean' ? 'opacity-80' : ''}`} />{q.type === 'multiple' && <select value="" onChange={(e) => { if (e.target.value) updateOption(qi, oi, e.target.value) }} className={`col-start-2 w-full rounded-xl border px-3 py-2 text-xs outline-none focus:border-cyan-400 sm:col-start-auto ${field}`} aria-label={`Choose a saved choice for option ${String.fromCharCode(65 + oi)}`}><option value="">↳ Use a previous choice…</option>{savedChoices.filter((choice) => choice.toLowerCase().includes(choiceSearch.toLowerCase())).map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>}</div>)}</div>
-      {q.type === 'multiple' && <div className="mt-5 rounded-xl border border-cyan-400/20 bg-gradient-to-r from-cyan-500/[0.08] to-violet-500/[0.08] p-3"><div className="mb-2 flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-bold text-cyan-300"><Sparkles size={13} className="mr-1 inline" /> Reusable Choice Library</p><span className={`text-[10px] ${muted}`}>{savedChoices.length} saved choices</span></div><input value={choiceSearch} onChange={(e) => setChoiceSearch(e.target.value)} placeholder="Search your saved choices..." className={`mb-2 w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-cyan-400 ${field}`} /><p className={`text-xs ${muted}`}>{savedChoices.length ? 'Pumili ng previous choice sa dropdown ng BAWAT answer field. Puwede kang gumamit ng magkakaibang saved choices sa A, B, C, at D.' : 'Wala pang saved choices. Ang mga choices sa quiz na ise-save mo ay awtomatikong idaragdag dito.'}</p></div>}</>}
+      {q.type === 'identification' ? <div><label className="mb-2 block text-sm font-bold">Correct answer</label><input value={q.correctText} onChange={(e) => updateQuestion(qi, 'correctText', e.target.value)} placeholder="Enter the exact correct answer" required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /><p className={`mt-2 text-xs ${muted}`}>Answers are checked without case sensitivity and ignore extra spaces.</p></div> : <><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold">{q.type === 'boolean' ? 'Select the correct answer' : 'Answer choices'}</p>{q.type === 'multiple' && <span className="text-xs text-cyan-300">A · B · C only — choose the correct answer</span>}</div><div className="space-y-3">{(q.type === 'multiple' ? q.options.slice(0, 3) : q.options).map((option, oi) => <div key={oi} className="grid grid-cols-[40px_minmax(0,1fr)] gap-2 sm:grid-cols-[40px_minmax(0,1fr)_190px]"><button type="button" onClick={() => updateQuestion(qi, 'correctAnswer', oi)} className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl border font-black ${q.correctAnswer === oi ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300' : 'border-white/10 bg-white/[0.03] text-slate-400'}`} title="Mark as correct answer">{q.correctAnswer === oi ? <Check size={18} /> : String.fromCharCode(65 + oi)}</button><input value={option} onChange={(e) => updateOption(qi, oi, e.target.value)} placeholder={q.type === 'boolean' ? option : `Enter choice ${String.fromCharCode(65 + oi)}`} readOnly={q.type === 'boolean'} required className={`min-w-0 w-full rounded-xl border px-3 py-3 outline-none focus:border-cyan-400 ${field} ${q.type === 'boolean' ? 'opacity-80' : ''}`} />{q.type === 'multiple' && <select value="" onChange={(e) => { const selected = e.target.value; if (selected) updateOption(qi, oi, selected) }} className={`col-start-2 w-full rounded-xl border px-3 py-2 text-xs outline-none focus:border-cyan-400 sm:col-start-auto ${field}`} aria-label={`Choose a previous choice for option ${String.fromCharCode(65 + oi)}`}><option value="">↳ Use a previous choice…</option>{getPreviousChoices(qi).map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>}</div>)}</div>
+      </>}
       <div className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.07] p-3 text-xs text-emerald-300"><CheckCircle2 size={14} className="mr-1 inline" /> Correct answer: {q.type === 'identification' ? (q.correctText || 'Not entered') : (q.options[q.correctAnswer] || 'Not selected')}</div></div>)}
-      <div className="flex flex-wrap justify-end gap-3 border-t border-white/10 pt-5"><button type="button" onClick={() => setShowCreate(false)} className={buttonSecondary}>Cancel</button><button type="submit" disabled={saving} className={buttonPrimary}>{saving ? 'Saving quiz...' : <><Zap size={17} className="mr-2" /> Save Quiz</>}</button></div></form></div></div>}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-5"><button type="button" onClick={() => { rememberChoices(newQuestions.filter((item) => item.type === 'multiple').flatMap((item) => item.options || [])); setNewQuestions((prev) => [...prev, emptyQuestion()]) }} className={buttonPrimary}><Plus size={17} className="mr-1" /> Add Question</button><div className="flex flex-wrap justify-end gap-3"><button type="button" onClick={closeQuizCreator} className={buttonSecondary}>Cancel</button><button type="submit" disabled={saving} className={buttonPrimary}>{saving ? 'Saving quiz...' : <><Zap size={17} className="mr-2" /> {editingQuiz ? 'Save Changes' : 'Save Quiz'}</>}</button></div></div></form></div></div>}
 
     {notice && <div className="fixed bottom-5 left-1/2 z-[60] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-xl border border-white/10 bg-[#211a35] px-5 py-3 text-sm font-semibold text-white shadow-2xl shadow-black/40"><Sparkles className="shrink-0 text-teal-300" size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss notice"><X size={16} /></button></div>}
   </div>
