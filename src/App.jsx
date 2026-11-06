@@ -817,13 +817,29 @@ export default function App() {
       }
     } catch (error) { console.error(error); setNotice('Quiz finished, but local result storage failed.') }
   }
+  function advanceAfterWrongAnswer(finalAnswers, questionIndex) {
+    // Give a short moment to show the correct answer, then move forward automatically.
+    // Wrong answers are locked and can never be revisited during this round.
+    setTimeout(() => {
+      if (questionIndex >= (activeQuiz?.questions?.length || 0) - 1) {
+        finishQuiz(finalAnswers)
+      } else {
+        setCurrentQuestion(questionIndex + 1)
+        setIdentificationDraft('')
+        setAnswerFeedback('')
+      }
+    }, 1100)
+  }
+
   function chooseAnswer(index) {
     if (answers[currentQuestion] !== undefined) return
     const correct = isCorrectAnswer(activeQuiz.questions[currentQuestion], index)
     if (gameRoomId) { submitGameAnswer(index); return }
-    setAnswers((previous) => ({ ...previous, [currentQuestion]: index }))
+    const finalAnswers = { ...answers, [currentQuestion]: index }
+    setAnswers(finalAnswers)
     setAnswerFeedback(correct ? 'correct' : 'wrong')
     if (soundEnabled) playAnswerTone(correct)
+    if (!correct) advanceAfterWrongAnswer(finalAnswers, currentQuestion)
   }
   function updateQuestion(questionIndex, fieldName, value) {
     setNewQuestions((previous) => previous.map((q, index) => index === questionIndex ? { ...q, [fieldName]: value } : q))
@@ -1064,9 +1080,11 @@ export default function App() {
             if (gameRoomId) submitGameAnswer(value)
             else {
               const correct = isCorrectAnswer(question, value)
-              setAnswers((previous) => ({ ...previous, [currentQuestion]: value }))
+              const finalAnswers = { ...answers, [currentQuestion]: value }
+              setAnswers(finalAnswers)
               setAnswerFeedback(correct ? 'correct' : 'wrong')
               if (soundEnabled) playAnswerTone(correct)
+              if (!correct) advanceAfterWrongAnswer(finalAnswers, currentQuestion)
             }
           }} className={buttonPrimary}>Lock answer</button></div> : <div className="grid gap-3">{(question.options || []).map((option, index) => {
             const selected = answers[currentQuestion] === index
@@ -1077,7 +1095,7 @@ export default function App() {
             return <button key={index} onClick={() => chooseAnswer(index)} disabled={answered} className={`flex items-center gap-3 rounded-2xl border p-4 text-left transition ${style} ${answered ? 'cursor-default' : 'hover:-translate-y-0.5'}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan-500/15 font-black text-cyan-300">{question.type === 'boolean' ? (index === 0 ? 'T' : 'F') : String.fromCharCode(65 + index)}</span><span className="flex-1 font-semibold">{option}</span>{answered && correct && <CheckCircle2 className="text-emerald-300" size={22} />}{wrongSelected && <X className="text-rose-300" size={22} />}</button>
           })}</div>}
           {answers[currentQuestion] !== undefined && <div className={`mt-4 rounded-2xl border p-4 ${isCorrectAnswer(question, answers[currentQuestion]) ? 'border-emerald-400/30 bg-emerald-500/10' : 'border-rose-400/30 bg-rose-500/10'}`}><p className={`font-bold ${isCorrectAnswer(question, answers[currentQuestion]) ? 'text-emerald-300' : 'text-rose-300'}`}>{isCorrectAnswer(question, answers[currentQuestion]) ? 'Correct answer! 🎉' : 'Not quite — keep going! 💪'}</p>{!isCorrectAnswer(question, answers[currentQuestion]) && <p className={`mt-1 text-sm ${muted}`}>Correct answer: <span className="font-bold text-emerald-300">{question.type === 'identification' ? question.correctText : question.options[question.correctAnswer]}</span></p>}</div>}
-          <div className="mt-8 flex items-center justify-between gap-3">{gameRoomId ? <div className="w-full rounded-xl border border-cyan-300/15 bg-cyan-300/[0.05] px-4 py-3 text-center text-sm font-semibold text-cyan-100">{answers[currentQuestion] !== undefined ? 'Answer locked — waiting for the squad…' : 'Submit your answer. The next question syncs for everyone.'}</div> : <><button className={buttonSecondary} disabled={currentQuestion === 0} onClick={() => { setCurrentQuestion((n) => n - 1); setIdentificationDraft(''); setAnswerFeedback('') }}>Previous</button>{currentQuestion < questions.length - 1 ? <button className={buttonPrimary} onClick={() => { setCurrentQuestion((n) => n + 1); setIdentificationDraft(''); setAnswerFeedback('') }}>Next question <ChevronRight className="ml-1" size={18} /></button> : <button className={buttonPrimary} onClick={() => finishQuiz()}>Submit answers <Trophy className="ml-2" size={18} /></button>}</>}</div>
+          <div className="mt-8 flex items-center justify-between gap-3">{gameRoomId ? <div className="w-full rounded-xl border border-cyan-300/15 bg-cyan-300/[0.05] px-4 py-3 text-center text-sm font-semibold text-cyan-100">{answers[currentQuestion] !== undefined ? 'Answer locked — waiting for the squad…' : 'Submit your answer. The next question syncs for everyone.'}</div> : <div className="flex w-full justify-end">{currentQuestion < questions.length - 1 ? <button className={buttonPrimary} disabled={answers[currentQuestion] === undefined || answerFeedback === 'wrong'} onClick={() => { setCurrentQuestion((n) => n + 1); setIdentificationDraft(''); setAnswerFeedback('') }}>Next question <ChevronRight className="ml-1" size={18} /></button> : <button className={buttonPrimary} disabled={answers[currentQuestion] === undefined || answerFeedback === 'wrong'} onClick={() => finishQuiz()}>Finish quiz <Trophy className="ml-2" size={18} /></button>}</div>}</div>
         </> : <div className="py-8 text-center"><div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-teal-600/30 to-cyan-600/20 text-teal-300"><Trophy size={42} /></div><p className={`mb-2 ${muted}`}>MISSION COMPLETE</p><h1 className="mb-3 text-3xl font-black">Your Results</h1><p className="mb-2 text-6xl font-black text-teal-300">{score}<span className="text-3xl text-slate-500">/{questions.length}</span></p><p className={`mb-8 ${muted}`}>You scored {Math.round(score / questions.length * 100)}%.</p><div className="mb-8 space-y-3 text-left">{questions.map((item, index) => { const correct = isCorrectAnswer(item, answers[index]); return <div key={index} className={`rounded-xl border p-4 ${correct ? 'border-emerald-500/30' : 'border-rose-500/30'}`}><p className="mb-2 font-semibold">{index + 1}. {item.question}</p><p className={correct ? 'text-emerald-300' : 'text-rose-300'}>Your answer: {answerLabel(item, answers[index])}</p>{!correct && <p className="mt-1 text-sm text-emerald-300">Correct answer: {item.type === 'identification' ? item.correctText : item.options[item.correctAnswer]}</p>}</div>})}</div>{gameRoomId ? <div className="space-y-5"><div className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.06] p-4 text-left"><h2 className="mb-3 flex items-center gap-2 font-black text-amber-200"><Trophy size={18} /> Room leaderboard</h2>{(gameRoom?.players || []).map((player) => { const playerAnswers = gameRoom?.playerAnswers?.[player.uid] || {}; const playerScore = questions.reduce((total, item, index) => total + (isCorrectAnswer(item, playerAnswers[index]) ? 1 : 0), 0); return { ...player, score: playerScore } }).sort((a,b) => b.score-a.score).map((player,index) => <div key={player.uid} className="flex items-center gap-3 border-t border-white/10 py-2"><span className="w-7 font-black text-amber-200">#{index+1}</span><span className="flex-1 font-semibold">{player.name}</span><span className="font-black text-cyan-200">{player.score}/{questions.length}</span></div>)}</div><div className="flex flex-wrap justify-center gap-3">{gameRoom?.creatorId === user.uid && <button className={buttonPrimary} onClick={startRematch}><RotateCcw className="mr-2" size={17} /> Rematch · same room</button>}<button className={buttonSecondary} onClick={closeQuiz}><ArrowLeft className="mr-2" size={17} /> Dashboard</button></div></div> : <div className="flex flex-wrap justify-center gap-3"><button className={buttonSecondary} onClick={closeQuiz}><ArrowLeft className="mr-2" size={17} /> Dashboard</button><button className={buttonPrimary} onClick={() => startQuiz(activeQuiz)}><RotateCcw className="mr-2" size={17} /> Play again</button></div>}</div>}
       </div></div></div>
   }
