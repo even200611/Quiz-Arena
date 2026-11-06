@@ -129,11 +129,9 @@ export default function App() {
   const [pendingGameId, setPendingGameId] = useState('')
   const [pendingGameRoom, setPendingGameRoom] = useState(null)
   const [joiningGame, setJoiningGame] = useState(false)
-  const [gameMessages, setGameMessages] = useState([])
-  const [gameChatText, setGameChatText] = useState('')
-  const [gameShowEmoji, setGameShowEmoji] = useState(false)
-  const [gameChatOpen, setGameChatOpen] = useState(true)
-  const gameChatEndRef = useRef(null)
+  const [secondsLeft, setSecondsLeft] = useState(30)
+  const advancingRoomRef = useRef(false)
+  const countdownStartedRef = useRef(false)
   const chatEndRef = useRef(null)
   const userName = displayName(user)
 
@@ -360,18 +358,108 @@ export default function App() {
   }, [user])
 
   useEffect(() => {
-    if (!user || user.isLocalGuest || user.isOfflineAccount || !navigator.onLine || !gameRoomId) { setGameRoom(null); setGameMessages([]); return }
-    const unsubRoom = onSnapshot(doc(db, 'game_rooms', gameRoomId), (snap) => {
+    if (!user || user.isLocalGuest || user.isOfflineAccount || !navigator.onLine || !gameRoomId) { setGameRoom(null); return }
+    return onSnapshot(doc(db, 'game_rooms', gameRoomId), (snap) => {
       if (snap.exists()) setGameRoom({ id: snap.id, ...snap.data() })
-    }, (error) => { console.error('Game room listener:', error); setNotice('Could not load game participants. Check Firestore rules.') })
-    const q = query(collection(db, 'chat_messages'), where('gameRoomId', '==', gameRoomId), limit(100))
-    const unsubMessages = onSnapshot(q, (snap) => {
-      setGameMessages(snap.docs.map((item) => ({ id: item.id, ...item.data() })).sort((a, b) => (a.createdAt?.toMillis?.() || 0) - (b.createdAt?.toMillis?.() || 0)))
-    }, (error) => { console.error('Game chat listener:', error); setNotice('Game chat could not load. Check Firestore rules.') })
-    return () => { unsubRoom(); unsubMessages() }
+      else { setGameRoom(null); setNotice('This multiplayer room is no longer available.') }
+    }, (error) => { console.error('Game room listener:', error); setNotice('Could not load multiplayer room. Check Firestore rules.') })
   }, [user, gameRoomId])
 
-  useEffect(() => { gameChatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [gameMessages, gameChatOpen])
+  // The Firestore room is the shared source of truth for every multiplayer client.
+  useEffect(() => {
+    if (!gameRoom || !gameRoomId) return
+    if (gameRoom.quiz?.questions?.length) {
+      setActiveQuiz({ ...gameRoom.quiz, id: gameRoom.quiz.id || gameRoom.quizId || gameRoomId })
+    }
+    if (Number.isInteger(gameRoom.currentQuestion)) {
+      setCurrentQuestion(gameRoom.currentQuestion)
+      setAnswers(gameRoom.playerAnswers?.[user?.uid] || {})
+    }
+    if (gameRoom.status === 'finished') setQuizFinished(true)
+    if (gameRoom.status === 'waiting' || gameRoom.status === 'countdown') setQuizFinished(false)
+  }, [gameRoom?.id, gameRoom?.status, gameRoom?.currentQuestion, gameRoom?.playerAnswers, gameRoomId, user?.uid])
+
+  // Host starts the live round after the synchronized 3-2-1 countdown.
+  useEffect(() => {
+    if (!gameRoomId || !gameRoom || gameRoom.status !== 'countdown') {
+      countdownStartedRef.current = false
+      return
+    }
+    const tick = async () => {
+      const remaining = Math.max(0, Math.ceil(((gameRoom.countdownEndsAt || 0) - Date.now()) / 1000))
+      setSecondsLeft(remaining)
+      if (remaining <= 0 && gameRoom.creatorId === user?.uid && !countdownStartedRef.current) {
+        countdownStartedRef.current = true
+        try {
+          await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+            status: 'playing',
+            questionEndsAt: Date.now() + 30000,
+            updatedAt: serverTimestamp(),
+          })
+        } catch (error) {
+          countdownStartedRef.current = false
+          console.error('Start multiplayer round:', error)
+          setNotice('Could not start the round. Check Firestore permissions.')
+        }
+      }
+    }
+    tick()
+    const timer = setInterval(tick, 250)
+    return () => clearInterval(timer)
+  }, [gameRoomId, gameRoom?.status, gameRoom?.countdownEndsAt, gameRoom?.creatorId, user?.uid])
+
+  useEffect(() => {
+    advancingRoomRef.current = false
+  }, [gameRoom?.currentQuestion])
+
+  // Every player sees the same deadline. The host advances once everyone answers or time expires.
+  useEffect(() => {
+    if (!gameRoomId || !gameRoom || gameRoom.status !== 'playing') {
+      setSecondsLeft(30)
+      advancingRoomRef.current = false
+      return
+    }
+    const tick = async () => {
+      const remaining = Math.max(0, Math.ceil(((gameRoom.questionEndsAt || 0) - Date.now()) / 1000))
+      setSecondsLeft(remaining)
+      if (gameRoom.creatorId !== user?.uid || advancingRoomRef.current) return
+      const members = gameRoom.memberIds || []
+      const submitted = gameRoom.playerAnswers || {}
+      const everyoneAnswered = members.length > 0 && members.every((uid) =>
+        Object.prototype.hasOwnProperty.call(submitted[uid] || {}, String(gameRoom.currentQuestion ?? 0))
+      )
+      if (everyoneAnswered || remaining <= 0) {
+        advancingRoomRef.current = true
+        const next = Number(gameRoom.currentQuestion || 0) + 1
+        try {
+          if (next >= (gameRoom.quiz?.questions?.length || 0)) {
+            await updateDoc(doc(db, 'game_rooms', gameRoomId), { status: 'finished', finishedAt: serverTimestamp(), updatedAt: serverTimestamp() })
+          } else {
+            await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+              currentQuestion: next,
+              questionEndsAt: Date.now() + 30000,
+              updatedAt: serverTimestamp(),
+            })
+          }
+        } catch (error) {
+          advancingRoomRef.current = false
+          console.error('Advance multiplayer question:', error)
+          setNotice('Could not sync the next question. Check Firestore permissions.')
+        }
+      }
+    }
+    tick()
+    const timer = setInterval(tick, 500)
+    return () => clearInterval(timer)
+  }, [gameRoomId, gameRoom?.status, gameRoom?.questionEndsAt, gameRoom?.currentQuestion, gameRoom?.playerAnswers, gameRoom?.memberIds, gameRoom?.creatorId, gameRoom?.quiz?.questions?.length, user?.uid])
+
+  useEffect(() => {
+    if (gameRoom?.status === 'playing') {
+      setCurrentQuestion(Number(gameRoom.currentQuestion || 0))
+      setAnswers(gameRoom.playerAnswers?.[user?.uid] || {})
+    }
+  }, [gameRoom?.currentQuestion, gameRoom?.playerAnswers, gameRoom?.status, user?.uid])
+
 
   const isDark = darkMode
   const page = isDark ? 'min-h-screen bg-[#101820] text-slate-100' : 'min-h-screen bg-slate-50 text-slate-900'
@@ -391,20 +479,32 @@ export default function App() {
 
   async function startQuiz(quiz) {
     if (!Array.isArray(quiz.questions) || !quiz.questions.length) return setNotice('This quiz has no questions yet.')
-    setActiveQuiz(quiz); setCurrentQuestion(0); setAnswers({}); setIdentificationDraft(''); setQuizFinished(false); setGameChatOpen(true)
+    setActiveQuiz(quiz); setCurrentQuestion(0); setAnswers({}); setIdentificationDraft(''); setQuizFinished(false)
     if (!navigator.onLine || user.isLocalGuest || user.isOfflineAccount) {
-      setGameRoomId(''); setGameRoom(null); setGameMessages([])
-      setNotice(user.isLocalGuest ? 'Guest practice started. Your quiz progress stays on this device.' : user.isOfflineAccount ? 'Offline account practice started. Your progress stays on this device.' : 'Offline practice started. Multiplayer and chat need internet.')
+      setGameRoomId(''); setGameRoom(null)
+      setNotice(user.isLocalGuest ? 'Guest practice started. Your quiz progress stays on this device.' : user.isOfflineAccount ? 'Offline account practice started. Your progress stays on this device.' : 'Offline practice started. Multiplayer needs internet.')
       return
     }
     try {
-      const roomData = { creatorId: user.uid, creatorName: userName, quizId: quiz.id, quiz: { id: quiz.id, title: quiz.title, category: quiz.category || 'General', difficulty: quiz.difficulty || 'Easy', questions: quiz.questions }, memberIds: [user.uid], players: [{ uid: user.uid, name: userName, joinedAt: Date.now() }], status: 'playing', createdAt: serverTimestamp(), updatedAt: serverTimestamp() }
+      const player = { uid: user.uid, name: userName, joinedAt: Date.now() }
+      const roomData = {
+        creatorId: user.uid, creatorName: userName, quizId: quiz.id,
+        quiz: { id: quiz.id, title: quiz.title, category: quiz.category || 'General', difficulty: quiz.difficulty || 'Easy', questions: quiz.questions },
+        memberIds: [user.uid], players: [player], readyPlayers: { [user.uid]: true },
+        playerAnswers: {}, reactions: [], currentQuestion: 0, status: 'waiting',
+        createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+      }
       const roomRef = await addDoc(collection(db, 'game_rooms'), roomData)
       setGameRoomId(roomRef.id)
       setGameRoom({ id: roomRef.id, ...roomData })
-    } catch (error) { console.error('Create game room:', error); setGameRoomId(''); setGameRoom(null); setNotice('Quiz started, but multiplayer invite could not be created.') }
+      setNotice('Room created! Invite your friends and wait in the lobby.')
+    } catch (error) {
+      console.error('Create game room:', error)
+      setGameRoomId(''); setGameRoom(null)
+      setNotice('Could not create multiplayer room. You can still practice solo.')
+    }
   }
-  function closeQuiz() { setActiveQuiz(null); setQuizFinished(false); setAnswers({}); setIdentificationDraft(''); setCurrentQuestion(0); setGameRoomId(''); setGameRoom(null); setGameMessages([]) }
+  function closeQuiz() { setActiveQuiz(null); setQuizFinished(false); setAnswers({}); setIdentificationDraft(''); setCurrentQuestion(0); setGameRoomId(''); setGameRoom(null) }
   async function acceptGameInvitation() {
     if (!user || !pendingGameId || !pendingGameRoom || joiningGame) return
     setJoiningGame(true)
@@ -414,18 +514,20 @@ export default function App() {
       if (!snap.exists()) throw new Error('This game room no longer exists.')
       const room = snap.data()
       if (!Array.isArray(room.quiz?.questions) || !room.quiz.questions.length) throw new Error('This room has no valid quiz.')
+      if (room.status !== 'waiting') throw new Error('This room has already started or finished. Ask the host for a new room.')
       if (!(room.memberIds || []).includes(user.uid)) {
         if ((room.memberIds || []).length >= 20) throw new Error('This game room is full (20 players maximum).')
         await updateDoc(ref, {
           memberIds: arrayUnion(user.uid),
           players: arrayUnion({ uid: user.uid, name: userName, joinedAt: Date.now() }),
+          [`readyPlayers.${user.uid}`]: false,
           updatedAt: serverTimestamp(),
         })
       }
       setGameRoomId(pendingGameId)
-      setGameRoom({ id: pendingGameId, ...room, memberIds: [...new Set([...(room.memberIds || []), user.uid])], players: (room.players || []).some((p) => p.uid === user.uid) ? room.players : [...(room.players || []), { uid: user.uid, name: userName, joinedAt: Date.now() }] })
+      setGameRoom({ id: pendingGameId, ...room, memberIds: [...new Set([...(room.memberIds || []), user.uid])], players: (room.players || []).some((p) => p.uid === user.uid) ? room.players : [...(room.players || []), { uid: user.uid, name: userName, joinedAt: Date.now() }], readyPlayers: { ...(room.readyPlayers || {}), [user.uid]: (room.memberIds || []).includes(user.uid) ? Boolean(room.readyPlayers?.[user.uid]) : false } })
       setActiveQuiz({ ...room.quiz, id: room.quiz.id || room.quizId || pendingGameId })
-      setCurrentQuestion(0); setAnswers({}); setQuizFinished(false); setGameChatOpen(true)
+      setCurrentQuestion(0); setAnswers({}); setQuizFinished(false)
       setPendingGameId(''); setPendingGameRoom(null)
       const url = new URL(window.location.href); url.searchParams.delete('game'); window.history.replaceState({}, '', url)
       setNotice(`You joined ${room.quiz.title || 'the quiz'}!`)
@@ -501,14 +603,97 @@ export default function App() {
   }
 
 
-  async function sendGameMessage(event) {
-    event?.preventDefault()
-    const text = gameChatText.trim()
-    if (!text || !user || user.isLocalGuest || user.isOfflineAccount || !gameRoomId || !navigator.onLine) return
-    setGameChatText(''); setGameShowEmoji(false)
+  async function setPlayerReady(ready) {
+    if (!gameRoomId || !user || gameRoom?.status !== 'waiting') return
     try {
-      await addDoc(collection(db, 'chat_messages'), { roomId: `game_${gameRoomId}`, gameRoomId, text, senderId: user.uid, senderName: userName, memberIds: gameRoom?.memberIds || [user.uid], createdAt: serverTimestamp() })
-    } catch (error) { console.error('Game chat send:', error); setGameChatText(text); setNotice('Game message not sent. Check Firestore rules.') }
+      await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+        [`readyPlayers.${user.uid}`]: ready,
+        updatedAt: serverTimestamp(),
+      })
+    } catch (error) {
+      console.error('Update ready state:', error)
+      setNotice('Could not update your ready status. Check Firestore permissions.')
+    }
+  }
+
+  async function startMultiplayerGame() {
+    if (!gameRoomId || gameRoom?.creatorId !== user?.uid || gameRoom?.status !== 'waiting') return
+    const members = gameRoom.memberIds || []
+    const ready = gameRoom.readyPlayers || {}
+    if (members.length < 2) return setNotice('Invite at least one friend before starting multiplayer.')
+    if (!members.every((uid) => ready[uid])) return setNotice('Wait until every player is ready.')
+    try {
+      await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+        status: 'countdown',
+        currentQuestion: 0,
+        playerAnswers: {},
+        countdownEndsAt: Date.now() + 3000,
+        questionEndsAt: null,
+        reactions: [],
+        updatedAt: serverTimestamp(),
+      })
+      setAnswers({}); setCurrentQuestion(0); setQuizFinished(false)
+    } catch (error) {
+      console.error('Start multiplayer game:', error)
+      setNotice('Could not start the game. Check Firestore permissions.')
+    }
+  }
+
+  async function submitGameAnswer(value) {
+    if (!gameRoomId || !gameRoom || gameRoom.status !== 'playing' || !user) return
+    const index = Number(gameRoom.currentQuestion || 0)
+    const alreadyAnswered = Object.prototype.hasOwnProperty.call(gameRoom.playerAnswers?.[user.uid] || {}, String(index))
+    if (alreadyAnswered) return
+    try {
+      await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+        [`playerAnswers.${user.uid}.${index}`]: value,
+        updatedAt: serverTimestamp(),
+      })
+      setAnswers((previous) => ({ ...previous, [index]: value }))
+    } catch (error) {
+      console.error('Submit multiplayer answer:', error)
+      setNotice('Your answer could not sync. Please try again.')
+    }
+  }
+
+  async function sendGameReaction(emoji) {
+    if (!gameRoomId || !user || gameRoom?.status !== 'playing') return
+    try {
+      await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+        reactions: arrayUnion({ id: `${user.uid}_${Date.now()}`, uid: user.uid, name: userName, emoji, at: Date.now() }),
+      })
+    } catch (error) {
+      console.error('Send reaction:', error)
+      setNotice('Reaction could not be sent.')
+    }
+  }
+
+  async function startRematch() {
+    if (!gameRoomId || gameRoom?.creatorId !== user?.uid || gameRoom?.status !== 'finished') return
+    try {
+      await updateDoc(doc(db, 'game_rooms', gameRoomId), {
+        status: 'waiting',
+        currentQuestion: 0,
+        playerAnswers: {},
+        readyPlayers: Object.fromEntries((gameRoom.memberIds || []).map((uid) => [uid, uid === user.uid])),
+        countdownEndsAt: null,
+        questionEndsAt: null,
+        reactions: [],
+        updatedAt: serverTimestamp(),
+      })
+      setAnswers({}); setCurrentQuestion(0); setQuizFinished(false)
+      setNotice('Rematch lobby opened! Same room, same players—get ready again.')
+    } catch (error) {
+      console.error('Start rematch:', error)
+      setNotice('Could not start rematch. Check Firestore permissions.')
+    }
+  }
+
+  function continueSoloPractice() {
+    setGameRoomId(''); setGameRoom(null)
+    setActiveQuiz((quiz) => quiz)
+    setCurrentQuestion(0); setAnswers({}); setQuizFinished(false)
+    setNotice('Solo practice started. Multiplayer room left.')
   }
 
   async function copyGameInvite() {
@@ -542,6 +727,7 @@ export default function App() {
   }
   function chooseAnswer(index) {
     if (answers[currentQuestion] !== undefined) return
+    if (gameRoomId) { submitGameAnswer(index); return }
     setAnswers((previous) => ({ ...previous, [currentQuestion]: index }))
   }
   function updateQuestion(questionIndex, fieldName, value) {
@@ -739,6 +925,31 @@ export default function App() {
   if (!authReady) return <div className={`${page} grid min-h-screen place-items-center`}><div className="text-center"><div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-2xl bg-teal-600/20 text-teal-300"><Activity className="animate-pulse" size={34} /></div><p className={muted}>Entering the Arena...</p></div></div>
   if (!user) return <Auth onLogin={setUser} />
 
+  if (activeQuiz && gameRoom && gameRoom.status === 'waiting') {
+    const readyMap = gameRoom.readyPlayers || {}
+    const isHost = gameRoom.creatorId === user?.uid
+    const allReady = (gameRoom.memberIds || []).length >= 2 && (gameRoom.memberIds || []).every((uid) => readyMap[uid])
+    return <div className={`${page} qa-neon min-h-screen px-4 py-8 sm:px-6`}><div className="mx-auto max-w-3xl">
+      <button onClick={continueSoloPractice} className={`mb-6 inline-flex items-center gap-2 ${muted} hover:text-cyan-300`}><ArrowLeft size={18} /> Leave room & practice solo</button>
+      <div className={`${panel} relative overflow-hidden rounded-3xl p-6 sm:p-9`}>
+        <div className="pointer-events-none absolute -right-10 -top-12 h-64 w-64 rounded-full bg-violet-500/10 blur-3xl" />
+        <div className="relative">
+          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1.5 text-xs font-black uppercase tracking-widest text-cyan-200"><Swords size={14} /> Multiplayer lobby</div>
+          <h1 className="mb-2 text-3xl font-black sm:text-4xl">{gameRoom.quiz?.title || activeQuiz.title}</h1>
+          <p className={`mb-6 text-sm ${muted}`}>Room code <span className="font-mono font-black text-cyan-300">{gameRoomId.slice(0, 8).toUpperCase()}</span> · Up to 20 players</p>
+          <div className="mb-6 grid grid-cols-2 gap-3">
+            <div className="rounded-2xl border border-cyan-300/15 bg-cyan-300/[0.06] p-4"><p className={`text-xs ${muted}`}>Players joined</p><p className="mt-1 text-3xl font-black text-cyan-200">{gameRoom.players?.length || 1}<span className="text-base text-slate-500">/20</span></p></div>
+            <div className="rounded-2xl border border-violet-300/15 bg-violet-300/[0.06] p-4"><p className={`text-xs ${muted}`}>Questions</p><p className="mt-1 text-3xl font-black text-violet-200">{activeQuiz.questions?.length || 0}</p></div>
+          </div>
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3"><h2 className="font-black">Squad lineup</h2><button onClick={copyGameInvite} className={buttonSecondary}><Copy size={16} className="mr-2" /> Copy invite link</button></div>
+          <div className="mb-7 space-y-2">{(gameRoom.players || []).map((player) => <div key={player.uid} className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.035] p-3"><div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-500/25 to-violet-500/25 font-black text-cyan-100">{initials(player.name)}</div><div className="min-w-0 flex-1"><p className="truncate font-bold">{player.name}{player.uid === gameRoom.creatorId ? ' · HOST' : ''}</p><p className={`text-xs ${muted}`}>{readyMap[player.uid] ? 'Ready to battle' : 'Waiting to get ready'}</p></div><span className={`rounded-full px-3 py-1 text-xs font-black ${readyMap[player.uid] ? 'bg-emerald-400/15 text-emerald-300' : 'bg-amber-400/10 text-amber-200'}`}>{readyMap[player.uid] ? 'READY' : 'NOT READY'}</span></div>)}</div>
+          <div className="flex flex-wrap gap-3">{!isHost && <button onClick={() => setPlayerReady(!readyMap[user.uid])} className={buttonPrimary}>{readyMap[user.uid] ? 'Cancel ready' : 'I’m ready'} <CheckCircle2 className="ml-2" size={18} /></button>}{isHost && <button onClick={startMultiplayerGame} disabled={!allReady} className={buttonPrimary}><Swords className="mr-2" size={18} /> Start battle</button>}<button onClick={continueSoloPractice} className={buttonSecondary}>Practice solo instead</button></div>
+          {isHost && <p className={`mt-4 text-xs ${muted}`}>{allReady ? 'Everyone is ready. Launch the battle!' : 'Invite at least one player and wait until everyone is ready.'}</p>}
+        </div>
+      </div>
+    </div></div>
+  }
+
   if (activeQuiz) {
     const questions = activeQuiz.questions || []
     const question = questions[currentQuestion]
@@ -746,14 +957,13 @@ export default function App() {
     return <div className={`${page} min-h-screen px-4 py-8 sm:px-6`}><div className="mx-auto max-w-3xl">
       <button onClick={closeQuiz} className={`mb-6 inline-flex items-center gap-2 ${muted} hover:text-teal-400`}><ArrowLeft size={18} /> Back to arena</button>
       <div className={`${panel} rounded-3xl p-5 sm:p-8`}>
-        {!quizFinished ? <>
+        {!quizFinished && gameRoom?.status === 'countdown' ? <div className="py-16 text-center"><div className="mx-auto mb-5 grid h-24 w-24 place-items-center rounded-3xl bg-gradient-to-br from-cyan-400/20 to-violet-500/20 text-cyan-200"><Swords size={48} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.25em] text-cyan-300">Get ready, squad</p><h1 className="text-5xl font-black">{Math.max(1, secondsLeft)}</h1><p className={`mt-3 ${muted}`}>The same quiz is about to begin for everyone.</p></div> : !quizFinished ? <>
           <div className="mb-6 flex items-start justify-between gap-4"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-teal-400"><Zap size={15} /> {activeQuiz.category}</p><h1 className="text-2xl font-black sm:text-3xl">{activeQuiz.title}</h1></div><span className="rounded-xl bg-teal-500/15 px-3 py-2 text-sm font-bold text-teal-300">{currentQuestion + 1}/{questions.length}</span></div>
           <div className="mb-8 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-teal-500 to-cyan-500 transition-all" style={{ width: `${((currentQuestion + 1) / questions.length) * 100}%` }} /></div>
-          <div className="mb-5 flex flex-wrap items-center gap-2 rounded-2xl border border-teal-400/20 bg-teal-500/[0.07] p-3"><div className="min-w-0 flex-1"><p className="text-sm font-bold"><Users size={16} className="mr-1 inline text-teal-300" /> {gameRoom?.players?.length || 1} player{(gameRoom?.players?.length || 1) === 1 ? '' : 's'} in this game</p><p className={`text-xs ${muted}`}>Share the invite link so friends can join this quiz room.</p></div><button onClick={copyGameInvite} className={buttonSecondary}><Copy size={16} className="mr-2" /> Invite players</button><button onClick={() => setGameChatOpen((v) => !v)} className={buttonSecondary}><MessageCircle size={16} className="mr-2" /> {gameChatOpen ? 'Hide chat' : 'Game chat'}</button></div>
-          {gameRoom?.players?.length > 0 && <div className="mb-5 flex flex-wrap gap-2">{gameRoom.players.map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold"><span className="mr-1 inline-block h-2 w-2 rounded-full bg-emerald-400" />{player.name}{player.uid === gameRoom.creatorId ? ' · Host' : ''}</span>)}</div>}
-          {gameChatOpen && <div className="mb-6 overflow-hidden rounded-2xl border border-white/10 bg-[#111b24]"><div className="flex items-center justify-between border-b border-white/10 px-4 py-3"><p className="font-bold"><MessageCircle size={16} className="mr-2 inline text-teal-300" />Live game chat</p><span className="text-xs text-emerald-300">{gameMessages.length} messages</span></div><div className="max-h-44 space-y-2 overflow-y-auto p-3">{gameMessages.length === 0 ? <p className="py-3 text-center text-xs text-slate-500">Say hi to your squad. Emojis welcome! 🎮</p> : gameMessages.map((message) => <div key={message.id} className="rounded-xl bg-white/[0.04] px-3 py-2"><p className="mb-1 text-[10px] font-bold text-teal-300">{message.senderName || 'Player'} · {timeLabel(message.createdAt)}</p><p className="break-words text-sm">{message.text}</p></div>)}<div ref={gameChatEndRef} /></div>{gameShowEmoji && <div className="flex flex-wrap gap-1 border-t border-white/10 p-2">{emojis.map((emoji) => <button key={emoji} type="button" onClick={() => setGameChatText((v) => v + emoji)} className="rounded-lg p-1 text-xl hover:bg-white/10">{emoji}</button>)}</div>}<form onSubmit={sendGameMessage} className="flex items-center gap-2 border-t border-white/10 p-2"><button type="button" onClick={() => setGameShowEmoji((v) => !v)} className="rounded-lg p-2 text-teal-300" title="Choose emoji"><Smile size={20} /></button><input value={gameChatText} onChange={(e) => setGameChatText(e.target.value)} maxLength={1000} placeholder="Message players..." className="min-w-0 flex-1 bg-transparent px-1 py-2 text-sm outline-none" /><button type="submit" disabled={!gameChatText.trim() || !gameRoomId} className={`${buttonPrimary} p-2.5`} aria-label="Send game message"><Send size={17} /></button></form></div>}
+          {gameRoomId && gameRoom?.status === 'playing' && <div className="mb-5 flex items-center justify-between rounded-2xl border border-violet-300/15 bg-violet-400/[0.06] px-4 py-3"><span className="text-xs font-bold uppercase tracking-wider text-violet-200">Time remaining</span><span className="font-mono text-xl font-black text-cyan-200">{secondsLeft}s</span></div>}
+          {gameRoomId && <div className="mb-5 rounded-2xl border border-cyan-300/15 bg-cyan-300/[0.05] p-4"><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="font-black"><Users size={16} className="mr-2 inline text-cyan-300" /> Live squad · {gameRoom?.players?.length || 1} players</p><button onClick={copyGameInvite} className={buttonSecondary}><Copy size={15} className="mr-2" /> Invite</button></div><div className="mb-3 flex flex-wrap gap-2">{(gameRoom?.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === gameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap items-center gap-2"><span className="mr-1 text-xs font-bold text-slate-400">React:</span>{['🔥','😂','👏','💯','😎','⚡','❤️'].map((emoji) => <button key={emoji} onClick={() => sendGameReaction(emoji)} className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-lg hover:border-cyan-300/40">{emoji}</button>)}</div>{(gameRoom?.reactions || []).slice(-5).length > 0 && <div className="mt-3 flex flex-wrap gap-2">{gameRoom.reactions.slice(-5).map((reaction) => <span key={reaction.id} className="rounded-full bg-violet-400/10 px-3 py-1 text-xs"><b>{reaction.name || 'Player'}</b> {reaction.emoji}</span>)}</div>}</div>}
           <h2 className="mb-6 text-xl font-bold leading-relaxed">{question.question}</h2>
-          {question.type === 'identification' ? <div className="space-y-3"><label className={`block text-sm font-bold ${muted}`}>Type your answer</label><input value={identificationDraft} disabled={answers[currentQuestion] !== undefined} onChange={(e) => setIdentificationDraft(e.target.value)} placeholder="Enter your answer..." className={`w-full rounded-xl border px-4 py-4 text-lg outline-none focus:border-cyan-400 ${field}`} /><button disabled={!identificationDraft.trim() || answers[currentQuestion] !== undefined} onClick={() => setAnswers((previous) => ({ ...previous, [currentQuestion]: identificationDraft.trim() }))} className={buttonPrimary}>Lock answer</button></div> : <div className="grid gap-3">{(question.options || []).map((option, index) => {
+          {question.type === 'identification' ? <div className="space-y-3"><label className={`block text-sm font-bold ${muted}`}>Type your answer</label><input value={identificationDraft} disabled={answers[currentQuestion] !== undefined} onChange={(e) => setIdentificationDraft(e.target.value)} placeholder="Enter your answer..." className={`w-full rounded-xl border px-4 py-4 text-lg outline-none focus:border-cyan-400 ${field}`} /><button disabled={!identificationDraft.trim() || answers[currentQuestion] !== undefined} onClick={() => gameRoomId ? submitGameAnswer(identificationDraft.trim()) : setAnswers((previous) => ({ ...previous, [currentQuestion]: identificationDraft.trim() }))} className={buttonPrimary}>Lock answer</button></div> : <div className="grid gap-3">{(question.options || []).map((option, index) => {
             const selected = answers[currentQuestion] === index
             const answered = answers[currentQuestion] !== undefined
             const correct = question.correctAnswer === index
@@ -762,8 +972,8 @@ export default function App() {
             return <button key={index} onClick={() => chooseAnswer(index)} disabled={answered} className={`flex items-center gap-3 rounded-2xl border p-4 text-left transition ${style} ${answered ? 'cursor-default' : 'hover:-translate-y-0.5'}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan-500/15 font-black text-cyan-300">{question.type === 'boolean' ? (index === 0 ? 'T' : 'F') : String.fromCharCode(65 + index)}</span><span className="flex-1 font-semibold">{option}</span>{answered && correct && <CheckCircle2 className="text-emerald-300" size={22} />}{wrongSelected && <X className="text-rose-300" size={22} />}</button>
           })}</div>}
           {answers[currentQuestion] !== undefined && <div className={`mt-4 rounded-2xl border p-4 ${isCorrectAnswer(question, answers[currentQuestion]) ? 'border-emerald-400/30 bg-emerald-500/10' : 'border-rose-400/30 bg-rose-500/10'}`}><p className={`font-bold ${isCorrectAnswer(question, answers[currentQuestion]) ? 'text-emerald-300' : 'text-rose-300'}`}>{isCorrectAnswer(question, answers[currentQuestion]) ? 'Correct answer! 🎉' : 'Not quite — keep going! 💪'}</p>{!isCorrectAnswer(question, answers[currentQuestion]) && <p className={`mt-1 text-sm ${muted}`}>Correct answer: <span className="font-bold text-emerald-300">{question.type === 'identification' ? question.correctText : question.options[question.correctAnswer]}</span></p>}</div>}
-          <div className="mt-8 flex items-center justify-between gap-3"><button className={buttonSecondary} disabled={currentQuestion === 0} onClick={() => { setCurrentQuestion((n) => n - 1); setIdentificationDraft('') }}>Previous</button>{currentQuestion < questions.length - 1 ? <button className={buttonPrimary} onClick={() => { setCurrentQuestion((n) => n + 1); setIdentificationDraft('') }}>Next question <ChevronRight className="ml-1" size={18} /></button> : <button className={buttonPrimary} onClick={() => finishQuiz()}>Submit answers <Trophy className="ml-2" size={18} /></button>}</div>
-        </> : <div className="py-8 text-center"><div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-teal-600/30 to-cyan-600/20 text-teal-300"><Trophy size={42} /></div><p className={`mb-2 ${muted}`}>MISSION COMPLETE</p><h1 className="mb-3 text-3xl font-black">Your Results</h1><p className="mb-2 text-6xl font-black text-teal-300">{score}<span className="text-3xl text-slate-500">/{questions.length}</span></p><p className={`mb-8 ${muted}`}>You scored {Math.round(score / questions.length * 100)}%.</p><div className="mb-8 space-y-3 text-left">{questions.map((item, index) => { const correct = isCorrectAnswer(item, answers[index]); return <div key={index} className={`rounded-xl border p-4 ${correct ? 'border-emerald-500/30' : 'border-rose-500/30'}`}><p className="mb-2 font-semibold">{index + 1}. {item.question}</p><p className={correct ? 'text-emerald-300' : 'text-rose-300'}>Your answer: {answerLabel(item, answers[index])}</p>{!correct && <p className="mt-1 text-sm text-emerald-300">Correct answer: {item.type === 'identification' ? item.correctText : item.options[item.correctAnswer]}</p>}</div>})}</div><div className="flex flex-wrap justify-center gap-3"><button className={buttonSecondary} onClick={closeQuiz}><ArrowLeft className="mr-2" size={17} /> Dashboard</button><button className={buttonPrimary} onClick={() => startQuiz(activeQuiz)}><RotateCcw className="mr-2" size={17} /> Play again</button></div></div>}
+          <div className="mt-8 flex items-center justify-between gap-3">{gameRoomId ? <div className="w-full rounded-xl border border-cyan-300/15 bg-cyan-300/[0.05] px-4 py-3 text-center text-sm font-semibold text-cyan-100">{answers[currentQuestion] !== undefined ? 'Answer locked — waiting for the squad…' : 'Submit your answer. The next question syncs for everyone.'}</div> : <><button className={buttonSecondary} disabled={currentQuestion === 0} onClick={() => { setCurrentQuestion((n) => n - 1); setIdentificationDraft('') }}>Previous</button>{currentQuestion < questions.length - 1 ? <button className={buttonPrimary} onClick={() => { setCurrentQuestion((n) => n + 1); setIdentificationDraft('') }}>Next question <ChevronRight className="ml-1" size={18} /></button> : <button className={buttonPrimary} onClick={() => finishQuiz()}>Submit answers <Trophy className="ml-2" size={18} /></button>}</>}</div>
+        </> : <div className="py-8 text-center"><div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-3xl bg-gradient-to-br from-teal-600/30 to-cyan-600/20 text-teal-300"><Trophy size={42} /></div><p className={`mb-2 ${muted}`}>MISSION COMPLETE</p><h1 className="mb-3 text-3xl font-black">Your Results</h1><p className="mb-2 text-6xl font-black text-teal-300">{score}<span className="text-3xl text-slate-500">/{questions.length}</span></p><p className={`mb-8 ${muted}`}>You scored {Math.round(score / questions.length * 100)}%.</p><div className="mb-8 space-y-3 text-left">{questions.map((item, index) => { const correct = isCorrectAnswer(item, answers[index]); return <div key={index} className={`rounded-xl border p-4 ${correct ? 'border-emerald-500/30' : 'border-rose-500/30'}`}><p className="mb-2 font-semibold">{index + 1}. {item.question}</p><p className={correct ? 'text-emerald-300' : 'text-rose-300'}>Your answer: {answerLabel(item, answers[index])}</p>{!correct && <p className="mt-1 text-sm text-emerald-300">Correct answer: {item.type === 'identification' ? item.correctText : item.options[item.correctAnswer]}</p>}</div>})}</div>{gameRoomId ? <div className="space-y-5"><div className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.06] p-4 text-left"><h2 className="mb-3 flex items-center gap-2 font-black text-amber-200"><Trophy size={18} /> Room leaderboard</h2>{(gameRoom?.players || []).map((player) => { const playerAnswers = gameRoom?.playerAnswers?.[player.uid] || {}; const playerScore = questions.reduce((total, item, index) => total + (isCorrectAnswer(item, playerAnswers[index]) ? 1 : 0), 0); return { ...player, score: playerScore } }).sort((a,b) => b.score-a.score).map((player,index) => <div key={player.uid} className="flex items-center gap-3 border-t border-white/10 py-2"><span className="w-7 font-black text-amber-200">#{index+1}</span><span className="flex-1 font-semibold">{player.name}</span><span className="font-black text-cyan-200">{player.score}/{questions.length}</span></div>)}</div><div className="flex flex-wrap justify-center gap-3">{gameRoom?.creatorId === user.uid && <button className={buttonPrimary} onClick={startRematch}><RotateCcw className="mr-2" size={17} /> Rematch · same room</button>}<button className={buttonSecondary} onClick={closeQuiz}><ArrowLeft className="mr-2" size={17} /> Dashboard</button></div></div> : <div className="flex flex-wrap justify-center gap-3"><button className={buttonSecondary} onClick={closeQuiz}><ArrowLeft className="mr-2" size={17} /> Dashboard</button><button className={buttonPrimary} onClick={() => startQuiz(activeQuiz)}><RotateCcw className="mr-2" size={17} /> Play again</button></div>}</div>}
       </div></div></div>
   }
 
@@ -843,7 +1053,7 @@ export default function App() {
       <footer className={`mt-8 flex flex-wrap items-center justify-center gap-2 text-center text-xs ${muted}`}><Gamepad2 size={15} /> Quiz Arena <span>·</span> Learn, play, improve <span>·</span><span className="text-teal-300">GG, have fun!</span></footer>
     </main>
 
-    {pendingGameRoom && <div className="fixed inset-0 z-[55] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"><div className={`${panel} w-full max-w-md rounded-3xl p-6`}><div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-teal-500/15 text-teal-300"><Gamepad2 size={28} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-teal-300">Game invitation</p><h2 className="mb-2 text-2xl font-black">Join {pendingGameRoom.quiz?.title || 'this quiz'}?</h2><p className={`mb-5 text-sm ${muted}`}>Invited by {pendingGameRoom.creatorName || 'a Quiz Arena player'}. There {pendingGameRoom.players?.length === 1 ? 'is' : 'are'} {pendingGameRoom.players?.length || 1} player{(pendingGameRoom.players?.length || 1) === 1 ? '' : 's'} in this room. Accept to join the player list and access the live game chat.</p><div className="mb-5 flex flex-wrap gap-2">{(pendingGameRoom.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === pendingGameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap justify-end gap-3"><button onClick={declineGameInvitation} disabled={joiningGame} className={buttonSecondary}>Decline</button><button onClick={acceptGameInvitation} disabled={joiningGame} className={buttonPrimary}>{joiningGame ? 'Joining...' : 'Accept & join game'} <ChevronRight className="ml-1" size={17} /></button></div></div></div>}
+    {pendingGameRoom && <div className="fixed inset-0 z-[55] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"><div className={`${panel} w-full max-w-md rounded-3xl p-6`}><div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-teal-500/15 text-teal-300"><Gamepad2 size={28} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-teal-300">Game invitation</p><h2 className="mb-2 text-2xl font-black">Join {pendingGameRoom.quiz?.title || 'this quiz'}?</h2><p className={`mb-5 text-sm ${muted}`}>Invited by {pendingGameRoom.creatorName || 'a Quiz Arena player'}. There {pendingGameRoom.players?.length === 1 ? 'is' : 'are'} {pendingGameRoom.players?.length || 1} player{(pendingGameRoom.players?.length || 1) === 1 ? '' : 's'} in this room. Accept to join the waiting lobby. The host starts when everyone is ready.</p><div className="mb-5 flex flex-wrap gap-2">{(pendingGameRoom.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === pendingGameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap justify-end gap-3"><button onClick={declineGameInvitation} disabled={joiningGame} className={buttonSecondary}>Decline</button><button onClick={acceptGameInvitation} disabled={joiningGame} className={buttonPrimary}>{joiningGame ? 'Joining...' : 'Accept & join game'} <ChevronRight className="ml-1" size={17} /></button></div></div></div>}
 
     {showCreate && <div className="fixed inset-0 z-50 overflow-y-auto bg-black/80 p-3 backdrop-blur-md sm:p-6"><div className={`${panel} mx-auto my-4 max-w-4xl rounded-3xl p-5 sm:my-8 sm:p-7`}>
       <div className="mb-7 flex items-start justify-between gap-4"><div><div className="mb-3 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-black uppercase tracking-wider text-cyan-300"><Sparkles size={14} /> Quiz Creator Studio</div><h2 className="text-3xl font-black">{editingQuiz ? 'Edit your challenge' : 'Build your challenge'}</h2><p className={`mt-2 text-sm ${muted}`}>Create your own questions and choose the answer format.</p></div><button type="button" onClick={closeQuizCreator} className={`rounded-xl p-2 ${muted} hover:bg-white/10`}><X size={22} /></button></div>
