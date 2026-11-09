@@ -102,84 +102,111 @@ function prepareQuizForPlay(quiz) {
   return { ...quiz, questions }
 }
 
+// Reuse one AudioContext so answer sounds start quickly and consistently.
+let answerAudioContext = null
+
 function playAnswerTone(isCorrect) {
   if (typeof window === 'undefined') return
   const AudioContextClass = window.AudioContext || window.webkitAudioContext
   if (!AudioContextClass) return
+
   try {
-    const context = new AudioContextClass()
+    if (!answerAudioContext || answerAudioContext.state === 'closed') {
+      answerAudioContext = new AudioContextClass()
+    }
+
+    const context = answerAudioContext
+    if (context.state === 'suspended') {
+      context.resume().catch((error) => console.warn('Could not resume audio:', error))
+    }
+
     const now = context.currentTime
-    const master = context.createGain()
     const compressor = context.createDynamicsCompressor()
-    // Stronger, normalized feedback than the previous quiet 0.16 gain.
-    // The compressor keeps louder tones from becoming harsh or clipping.
-    master.gain.setValueAtTime(0.9, now)
-    compressor.threshold.setValueAtTime(-10, now)
-    compressor.knee.setValueAtTime(12, now)
-    compressor.ratio.setValueAtTime(8, now)
+    compressor.threshold.setValueAtTime(-20, now)
+    compressor.knee.setValueAtTime(14, now)
+    compressor.ratio.setValueAtTime(10, now)
     compressor.attack.setValueAtTime(0.003, now)
     compressor.release.setValueAtTime(0.16, now)
-    master.connect(compressor)
-    compressor.connect(context.destination)
 
-    const toneGain = context.createGain()
-    toneGain.gain.setValueAtTime(0.0001, now)
-    toneGain.gain.exponentialRampToValueAtTime(isCorrect ? 0.95 : 0.9, now + 0.025)
-    toneGain.gain.exponentialRampToValueAtTime(0.0001, now + (isCorrect ? 0.72 : 0.62))
-    toneGain.connect(master)
+    // Extra output gain makes the sound more audible at moderate device volume.
+    // Compression helps control peaks and reduce harsh clipping.
+    const masterGain = context.createGain()
+    masterGain.gain.setValueAtTime(1.55, now)
+    compressor.connect(masterGain)
+    masterGain.connect(context.destination)
+
+    const soundBus = context.createGain()
+    soundBus.gain.setValueAtTime(1, now)
+    soundBus.connect(compressor)
+
+    const addTone = ({ frequency, endFrequency, start = 0, duration = 0.22, type = 'sine', volume = 0.55 }) => {
+      const oscillator = context.createOscillator()
+      const envelope = context.createGain()
+      const toneStart = now + start
+      const toneEnd = toneStart + duration
+
+      oscillator.type = type
+      oscillator.frequency.setValueAtTime(frequency, toneStart)
+      if (endFrequency) {
+        oscillator.frequency.exponentialRampToValueAtTime(endFrequency, toneEnd)
+      }
+
+      envelope.gain.setValueAtTime(0.0001, toneStart)
+      envelope.gain.exponentialRampToValueAtTime(volume, toneStart + 0.012)
+      envelope.gain.setValueAtTime(volume, Math.max(toneStart + 0.02, toneEnd - 0.045))
+      envelope.gain.exponentialRampToValueAtTime(0.0001, toneEnd)
+
+      oscillator.connect(envelope)
+      envelope.connect(soundBus)
+      oscillator.start(toneStart)
+      oscillator.stop(toneEnd + 0.01)
+    }
 
     if (isCorrect) {
-      ;[660, 880, 1100, 1320].forEach((frequency, index) => {
-        const oscillator = context.createOscillator()
-        oscillator.type = 'triangle'
-        oscillator.frequency.setValueAtTime(frequency, now + index * 0.12)
-        oscillator.connect(toneGain)
-        oscillator.start(now + index * 0.12)
-        oscillator.stop(now + index * 0.12 + 0.19)
+      // Bright four-note victory chime with a fuller upper harmonic.
+      ;[
+        { frequency: 784, start: 0, duration: 0.24, volume: 0.52 },
+        { frequency: 988, start: 0.11, duration: 0.25, volume: 0.52 },
+        { frequency: 1175, start: 0.22, duration: 0.28, volume: 0.54 },
+        { frequency: 1568, start: 0.34, duration: 0.38, volume: 0.58 },
+      ].forEach((note) => {
+        addTone({ ...note, type: 'triangle' })
+        addTone({
+          frequency: note.frequency * 2,
+          start: note.start,
+          duration: note.duration * 0.72,
+          volume: 0.12,
+          type: 'sine',
+        })
       })
     } else {
-      const oscillator = context.createOscillator()
-      oscillator.type = 'sawtooth'
-      oscillator.frequency.setValueAtTime(260, now)
-      oscillator.frequency.exponentialRampToValueAtTime(82, now + 0.42)
-      oscillator.connect(toneGain)
-      oscillator.start(now)
-      oscillator.stop(now + 0.46)
+      // Deeper descending buzzer with a low supporting tone.
+      addTone({
+        frequency: 185,
+        endFrequency: 78,
+        duration: 0.48,
+        volume: 0.68,
+        type: 'sawtooth',
+      })
+      addTone({
+        frequency: 92,
+        endFrequency: 55,
+        duration: 0.42,
+        volume: 0.42,
+        type: 'triangle',
+      })
     }
 
-    if (context.state === 'suspended') context.resume().catch(() => {})
-    window.setTimeout(() => context.close().catch(() => {}), 1000)
+    // Disconnect the temporary nodes after playback; keep the shared context alive.
+    window.setTimeout(() => {
+      try {
+        soundBus.disconnect()
+        compressor.disconnect()
+        masterGain.disconnect()
+      } catch {}
+    }, 1100)
   } catch (error) {
     console.warn('Audio feedback unavailable:', error)
-  }
-}
-
-async function copyTextToClipboard(text) {
-  try {
-    if (navigator.clipboard?.writeText && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch (error) {
-    console.warn('Clipboard API unavailable; trying fallback:', error)
-  }
-
-  try {
-    const field = document.createElement('textarea')
-    field.value = text
-    field.setAttribute('readonly', '')
-    field.style.position = 'fixed'
-    field.style.opacity = '0'
-    field.style.pointerEvents = 'none'
-    document.body.appendChild(field)
-    field.select()
-    field.setSelectionRange(0, field.value.length)
-    const copied = document.execCommand('copy')
-    document.body.removeChild(field)
-    return copied
-  } catch (error) {
-    console.warn('Clipboard fallback failed:', error)
-    return false
   }
 }
 const isCorrectAnswer = (question, answer) => question.type === 'identification'
@@ -776,16 +803,14 @@ export default function App() {
     if (alreadyAnswered) return
     const liveQuestion = gameRoom.quiz?.questions?.[index] || activeQuiz?.questions?.[index]
     const correct = liveQuestion ? isCorrectAnswer(liveQuestion, value) : false
-    // Start audio immediately inside the player's tap handler. This is more
-    // reliable on mobile browsers that restrict audio after async network work.
-    if (soundEnabled) playAnswerTone(correct)
-    setAnswerFeedback(correct ? 'correct' : 'wrong')
     try {
       await updateDoc(doc(db, 'game_rooms', gameRoomId), {
         [`playerAnswers.${user.uid}.${index}`]: value,
         updatedAt: serverTimestamp(),
       })
       setAnswers((previous) => ({ ...previous, [index]: value }))
+      setAnswerFeedback(correct ? 'correct' : 'wrong')
+      if (soundEnabled) playAnswerTone(correct)
     } catch (error) {
       console.error('Submit multiplayer answer:', error)
       setNotice(`Your answer could not sync (${error.code || 'unknown'}). Please retry.`)
@@ -838,9 +863,8 @@ export default function App() {
   async function copyGameInvite() {
     if (!gameRoomId) return setNotice('Game invite is not ready yet.')
     const link = `${window.location.origin}${window.location.pathname}?game=${gameRoomId}`
-    const copied = await copyTextToClipboard(link)
-    if (copied) setNotice('✓ GAME INVITE LINK COPIED! Paste it into Messenger or send it to your squad.')
-    else setNotice('Could not copy automatically. Your invite link is: ' + link)
+    try { await navigator.clipboard.writeText(link); setNotice('Game invitation link copied! Send it to your friends.') }
+    catch { setNotice(link) }
   }
   async function finishQuiz(finalAnswers = answers) {
     const questions = activeQuiz.questions
@@ -1010,10 +1034,8 @@ export default function App() {
       const ref = await addDoc(collection(db, 'invites'), { creatorId: user.uid, creatorName: userName, status: 'active', createdAt: serverTimestamp() })
       const link = `${window.location.origin}${window.location.pathname}?invite=${ref.id}`
       setInviteCode(ref.id); setInviteLink(link)
-      const copied = await copyTextToClipboard(link)
-      setNotice(copied
-        ? '✓ INVITE LINK COPIED! You can paste it into Messenger or any chat.'
-        : 'Invite link created. Tap Copy beside the link below.')
+      try { await navigator.clipboard.writeText(link); setNotice('Invite link created and copied!') }
+      catch { setNotice('Invite link created. Copy it from the field below.') }
     } catch (error) { console.error(error); setNotice('Could not create invite. Check Firestore rules.') }
     finally { setInviteBusy(false) }
   }
@@ -1102,9 +1124,9 @@ export default function App() {
             <div className="rounded-2xl border border-cyan-300/15 bg-cyan-300/[0.06] p-4"><p className={`text-xs ${muted}`}>Players joined</p><p className="mt-1 text-3xl font-black text-cyan-200">{gameRoom.players?.length || 1}<span className="text-base text-slate-500">/20</span></p></div>
             <div className="rounded-2xl border border-violet-300/15 bg-violet-300/[0.06] p-4"><p className={`text-xs ${muted}`}>Questions</p><p className="mt-1 text-3xl font-black text-violet-200">{activeQuiz.questions?.length || 0}</p></div>
           </div>
-          <div className="mb-6 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-center"><h2 className="font-black">Squad lineup</h2><button onClick={copyGameInvite} className={`${buttonSecondary} w-full sm:w-auto`}><Copy size={16} className="mr-2" /> Copy invite link</button></div>
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3"><h2 className="font-black">Squad lineup</h2><button onClick={copyGameInvite} className={buttonSecondary}><Copy size={16} className="mr-2" /> Copy invite link</button></div>
           <div className="mb-7 space-y-2">{(gameRoom.players || []).map((player) => <div key={player.uid} className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.035] p-3"><div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-500/25 to-violet-500/25 font-black text-cyan-100">{initials(player.name)}</div><div className="min-w-0 flex-1"><p className="truncate font-bold">{player.name}{player.uid === gameRoom.creatorId ? ' · HOST' : ''}</p><p className={`text-xs ${muted}`}>{readyMap[player.uid] ? 'Ready to battle' : 'Waiting to get ready'}</p></div><span className={`rounded-full px-3 py-1 text-xs font-black ${readyMap[player.uid] ? 'bg-emerald-400/15 text-emerald-300' : 'bg-amber-400/10 text-amber-200'}`}>{readyMap[player.uid] ? 'READY' : 'NOT READY'}</span></div>)}</div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:gap-3">{!isHost && <button onClick={() => setPlayerReady(!readyMap[user.uid])} disabled={readyBusy} className={`${buttonPrimary} w-full sm:w-auto`}>{readyBusy ? 'Updating…' : readyMap[user.uid] ? 'Cancel ready' : 'I’m ready'} <CheckCircle2 className="ml-2" size={18} /></button>}{isHost && <button onClick={startMultiplayerGame} disabled={!allReady} className={`${buttonPrimary} w-full sm:w-auto`}><Swords className="mr-2" size={18} /> Start battle</button>}<button onClick={continueSoloPractice} className={`${buttonSecondary} w-full sm:w-auto`}>Practice solo instead</button></div>
+          <div className="flex flex-wrap gap-3">{!isHost && <button onClick={() => setPlayerReady(!readyMap[user.uid])} disabled={readyBusy} className={buttonPrimary}>{readyBusy ? 'Updating…' : readyMap[user.uid] ? 'Cancel ready' : 'I’m ready'} <CheckCircle2 className="ml-2" size={18} /></button>}{isHost && <button onClick={startMultiplayerGame} disabled={!allReady} className={buttonPrimary}><Swords className="mr-2" size={18} /> Start battle</button>}<button onClick={continueSoloPractice} className={buttonSecondary}>Practice solo instead</button></div>
           {isHost && <p className={`mt-4 text-xs ${muted}`}>{allReady ? 'Everyone is ready. Launch the battle!' : 'Share the invite link. Your squad must press READY before you can launch.'}</p>}
         </div>
       </div>
@@ -1117,9 +1139,9 @@ export default function App() {
     const score = questions.reduce((total, item, index) => total + (isCorrectAnswer(item, answers[index]) ? 1 : 0), 0)
     return <div className={`${page} min-h-screen px-4 py-8 sm:px-6`}><div className="mx-auto max-w-3xl">
       <button onClick={closeQuiz} className={`mb-6 inline-flex items-center gap-2 ${muted} hover:text-teal-400`}><ArrowLeft size={18} /> Back to arena</button>
-      <div className={`${panel} rounded-2xl p-4 sm:rounded-3xl sm:p-8`}>
+      <div className={`${panel} rounded-3xl p-5 sm:p-8`}>
         {!quizFinished && gameRoom?.status === 'countdown' ? <div className="py-16 text-center"><div className="mx-auto mb-5 grid h-24 w-24 place-items-center rounded-3xl bg-gradient-to-br from-cyan-400/20 to-violet-500/20 text-cyan-200"><Swords size={48} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.25em] text-cyan-300">Get ready, squad</p><h1 className="text-5xl font-black">{Math.max(1, secondsLeft)}</h1><p className={`mt-3 ${muted}`}>The same quiz is about to begin for everyone.</p></div> : !quizFinished ? <>
-          <div className="mb-5 flex items-start justify-between gap-2 sm:mb-6 sm:gap-4"><div className="min-w-0"><p className="mb-2 flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-teal-400"><Zap size={15} /> {activeQuiz.category}</p><h1 className="text-2xl font-black sm:text-3xl">{activeQuiz.title}</h1><p className="mt-1 text-xs text-cyan-300">RANDOM ROUND · THINK FAST · HAVE FUN</p></div><div className="flex shrink-0 items-center gap-1.5"><button onClick={() => setSoundEnabled((value) => !value)} className={`${buttonSecondary} p-2.5`} title={soundEnabled ? 'Turn sounds off' : 'Turn sounds on'} aria-label={soundEnabled ? 'Turn sounds off' : 'Turn sounds on'}>{soundEnabled ? <Volume2 size={18} /> : <VolumeX size={18} />}</button><span className="rounded-xl bg-teal-500/15 px-3 py-2 text-sm font-bold text-teal-300">{currentQuestion + 1}/{questions.length}</span></div></div>
+          <div className="mb-6 flex items-start justify-between gap-4"><div><p className="mb-2 flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-teal-400"><Zap size={15} /> {activeQuiz.category}</p><h1 className="text-2xl font-black sm:text-3xl">{activeQuiz.title}</h1><p className="mt-1 text-xs text-cyan-300">RANDOM ROUND · THINK FAST · HAVE FUN</p></div><div className="flex items-center gap-2"><button onClick={() => setSoundEnabled((value) => !value)} className={`${buttonSecondary} p-2.5`} title={soundEnabled ? 'Turn sounds off' : 'Turn sounds on'} aria-label={soundEnabled ? 'Turn sounds off' : 'Turn sounds on'}>{soundEnabled ? <Volume2 size={18} /> : <VolumeX size={18} />}</button><span className="rounded-xl bg-teal-500/15 px-3 py-2 text-sm font-bold text-teal-300">{currentQuestion + 1}/{questions.length}</span></div></div>
           <div className="mb-8 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-teal-500 to-cyan-500 transition-all" style={{ width: `${((currentQuestion + 1) / questions.length) * 100}%` }} /></div>
           {gameRoomId && gameRoom?.status === 'playing' && <div className="mb-5 flex items-center justify-between rounded-2xl border border-violet-300/15 bg-violet-400/[0.06] px-4 py-3"><span className="text-xs font-bold uppercase tracking-wider text-violet-200">Time remaining</span><span className="font-mono text-xl font-black text-cyan-200">{secondsLeft}s</span></div>}
           {gameRoomId && <div className="mb-5 rounded-2xl border border-cyan-300/15 bg-cyan-300/[0.05] p-4"><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="font-black"><Users size={16} className="mr-2 inline text-cyan-300" /> Live squad · {gameRoom?.players?.length || 1} players</p><button onClick={copyGameInvite} className={buttonSecondary}><Copy size={15} className="mr-2" /> Invite</button></div><div className="mb-3 flex flex-wrap gap-2">{(gameRoom?.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === gameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap items-center gap-2"><span className="mr-1 text-xs font-bold text-slate-400">React:</span>{['🔥','😂','👏','💯','😎','⚡','❤️'].map((emoji) => <button key={emoji} onClick={() => sendGameReaction(emoji)} className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 text-lg hover:border-cyan-300/40">{emoji}</button>)}</div>{(gameRoom?.reactions || []).slice(-5).length > 0 && <div className="mt-3 flex flex-wrap gap-2">{gameRoom.reactions.slice(-5).map((reaction) => <span key={reaction.id} className="rounded-full bg-violet-400/10 px-3 py-1 text-xs"><b>{reaction.name || 'Player'}</b> {reaction.emoji}</span>)}</div>}</div>}
@@ -1142,7 +1164,7 @@ export default function App() {
             const correct = question.correctAnswer === index
             const wrongSelected = answered && selected && !correct
             const style = answered && correct ? 'border-emerald-400 bg-emerald-500/15 text-emerald-300' : wrongSelected ? 'border-rose-400 bg-rose-500/15 text-rose-300' : isDark ? 'border-white/10 hover:border-cyan-400 hover:bg-cyan-500/10' : 'border-slate-200 hover:border-cyan-400'
-            return <button key={index} onClick={() => chooseAnswer(index)} disabled={answered} className={`flex min-w-0 items-center gap-3 rounded-2xl border p-3 text-left transition sm:p-4 ${style} ${answered ? 'cursor-default' : 'hover:-translate-y-0.5'}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan-500/15 font-black text-cyan-300">{question.type === 'boolean' ? (index === 0 ? 'T' : 'F') : String.fromCharCode(65 + index)}</span><span className="flex-1 font-semibold">{option}</span>{answered && correct && <CheckCircle2 className="text-emerald-300" size={22} />}{wrongSelected && <X className="text-rose-300" size={22} />}</button>
+            return <button key={index} onClick={() => chooseAnswer(index)} disabled={answered} className={`flex items-center gap-3 rounded-2xl border p-4 text-left transition ${style} ${answered ? 'cursor-default' : 'hover:-translate-y-0.5'}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-cyan-500/15 font-black text-cyan-300">{question.type === 'boolean' ? (index === 0 ? 'T' : 'F') : String.fromCharCode(65 + index)}</span><span className="flex-1 font-semibold">{option}</span>{answered && correct && <CheckCircle2 className="text-emerald-300" size={22} />}{wrongSelected && <X className="text-rose-300" size={22} />}</button>
           })}</div>}
           {answers[currentQuestion] !== undefined && <div className={`mt-4 rounded-2xl border p-4 ${isCorrectAnswer(question, answers[currentQuestion]) ? 'border-emerald-400/30 bg-emerald-500/10' : 'border-rose-400/30 bg-rose-500/10'}`}><p className={`font-bold ${isCorrectAnswer(question, answers[currentQuestion]) ? 'text-emerald-300' : 'text-rose-300'}`}>{isCorrectAnswer(question, answers[currentQuestion]) ? 'Correct answer! 🎉' : 'Not quite — keep going! 💪'}</p>{!isCorrectAnswer(question, answers[currentQuestion]) && <p className={`mt-1 text-sm ${muted}`}>Correct answer: <span className="font-bold text-emerald-300">{question.type === 'identification' ? question.correctText : question.options[question.correctAnswer]}</span></p>}</div>}
           <div className="mt-8 flex items-center justify-between gap-3">{gameRoomId ? <div className="w-full rounded-xl border border-cyan-300/15 bg-cyan-300/[0.05] px-4 py-3 text-center text-sm font-semibold text-cyan-100">{answers[currentQuestion] !== undefined ? 'Answer locked — waiting for the squad…' : 'Submit your answer. The next question syncs for everyone.'}</div> : <div className="flex w-full justify-end">{currentQuestion < questions.length - 1 ? <button className={buttonPrimary} disabled={answers[currentQuestion] === undefined || answerFeedback === 'wrong'} onClick={() => { setCurrentQuestion((n) => n + 1); setIdentificationDraft(''); setAnswerFeedback('') }}>Next question <ChevronRight className="ml-1" size={18} /></button> : <button className={buttonPrimary} disabled={answers[currentQuestion] === undefined || answerFeedback === 'wrong'} onClick={() => finishQuiz()}>Finish quiz <Trophy className="ml-2" size={18} /></button>}</div>}</div>
@@ -1183,24 +1205,6 @@ export default function App() {
       .qa-neon .fixed.inset-0.z-50 .bg-gradient-to-br.from-cyan-500 { box-shadow:0 0 24px rgba(57,231,255,.16); }
       .qa-neon .fixed.bottom-5 { border-color:rgba(57,231,255,.24)!important; box-shadow:0 12px 50px rgba(0,0,0,.45),0 0 25px rgba(57,231,255,.08)!important; }
       @media(max-width:1023px){ .qa-neon main { margin-left:0!important; } }
-      @media(max-width:640px){
-        .qa-neon main { padding:12px 12px calc(24px + env(safe-area-inset-bottom))!important; }
-        .qa-neon main header { align-items:flex-start!important; gap:10px!important; padding:8px 0 14px!important; }
-        .qa-neon main header h1 { font-size:1.15rem!important; line-height:1.25!important; }
-        .qa-neon main section { min-width:0; }
-        .qa-neon main section > .relative.mb-7 { padding:18px!important; border-radius:22px!important; }
-        .qa-neon main section > .relative.mb-7 h2 { font-size:1.55rem!important; line-height:1.15!important; }
-        .qa-neon main section > .relative.mb-7 p { line-height:1.5!important; }
-        .qa-neon main section .rounded-2xl, .qa-neon main section .rounded-3xl { min-width:0; }
-        .qa-neon main section input:not([type=checkbox]), .qa-neon main section textarea, .qa-neon main section select { min-width:0; max-width:100%; font-size:16px!important; }
-        .qa-neon main section button { min-height:42px; }
-        .qa-neon .fixed.inset-0.z-50 > div { min-height:100dvh; border-radius:0!important; padding:14px!important; }
-        .qa-neon .fixed.inset-0.z-50 textarea { min-height:86px; }
-        .qa-neon .fixed.inset-0.z-50 button { min-height:42px; }
-        .qa-neon .fixed.inset-0.z-50 .grid.grid-cols-3 { grid-template-columns:1fr; }
-        .qa-neon .fixed.inset-0.z-50 .grid.grid-cols-3 button { padding:11px 8px; }
-        .qa-neon .fixed.bottom-5 { bottom:calc(12px + env(safe-area-inset-bottom))!important; width:calc(100% - 24px); max-width:440px!important; padding:13px 15px!important; }
-      }
       @media(prefers-reduced-motion:reduce){ .qa-neon * { transition:none!important; animation:none!important; } }
     `}</style>
     <div className="pointer-events-none fixed inset-0 overflow-hidden"><div className="absolute -left-40 -top-40 h-96 w-96 rounded-full bg-teal-700/[0.07] blur-3xl" /><div className="absolute right-0 top-1/3 h-96 w-96 rounded-full bg-sky-700/[0.05] blur-3xl" /></div>
@@ -1232,7 +1236,7 @@ export default function App() {
         <div className={`${panel} rounded-2xl p-5`}><div className="mb-4 flex items-center gap-3"><div className="grid h-11 w-11 place-items-center rounded-xl bg-cyan-500/15 text-cyan-300"><Search size={21} /></div><div><h2 className="font-black">Find players</h2><p className={`text-sm ${muted}`}>Grow your Arena squad.</p></div></div><div className="relative mb-4"><Search className={`absolute left-3 top-1/2 -translate-y-1/2 ${muted}`} size={17} /><input value={friendSearch} onChange={(e) => setFriendSearch(e.target.value)} placeholder="Search players..." className={`w-full rounded-xl border py-3 pl-10 pr-3 outline-none focus:border-teal-500 ${field}`} /></div><div className="space-y-2">{filteredPeople.slice(0, 12).map((p) => { const alreadyFriend = friends.some((f) => f.otherId === p.id); return <div key={p.id} className="flex items-center gap-3 rounded-xl p-3 transition hover:bg-white/[0.03]"><div className="grid h-10 w-10 place-items-center rounded-xl bg-teal-500/15 font-black text-teal-300">{initials(p.displayName || p.name)}</div><div className="min-w-0 flex-1"><p className="truncate font-bold">{p.displayName || p.name || 'Quiz Player'}</p><p className={`truncate text-xs ${muted}`}>{p.email || 'Quiz Arena player'}</p></div>{alreadyFriend ? <span className="text-xs font-semibold text-emerald-300"><Check size={15} className="mr-1 inline" /> Friend</span> : <button onClick={() => sendFriendRequest(p)} className={`${buttonSecondary} px-3 py-2 text-xs`}><UserPlus size={15} className="mr-1" /> Add</button>}</div>})}{filteredPeople.length === 0 && <p className={`py-6 text-center text-sm ${muted}`}>No player profiles found yet.</p>}</div><p className={`mt-4 text-xs ${muted}`}>Players appear here after their profile is created in Firestore.</p></div></section>}
 
       {activeTab === 'Invite Friends' && <section className="mx-auto max-w-3xl"><div className="relative overflow-hidden rounded-3xl border border-teal-400/20 bg-gradient-to-br from-teal-800 via-cyan-800 to-slate-800 p-6 sm:p-9"><div className="absolute -right-8 -top-8 text-white/[0.08]"><Users size={190} /></div><div className="relative"><div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-white/15"><UserPlus size={29} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-teal-200">Build your squad</p><h2 className="mb-3 text-3xl font-black sm:text-4xl">The Arena is better together.</h2><p className="mb-7 max-w-xl text-sm leading-6 text-teal-100">Create a personal invitation link. Send it through Messenger, Facebook, or any app. When your friend opens the link and accepts, you can chat privately.</p><button onClick={createInvite} disabled={inviteBusy} className="rounded-xl bg-white px-5 py-3 font-black text-teal-800 transition hover:-translate-y-0.5 disabled:opacity-60">{inviteBusy ? 'Creating link...' : <><Link2 className="mr-2 inline" size={18} /> Create & copy invite link</>}</button></div></div>
-        {inviteLink && <div className={`${panel} mt-5 rounded-2xl p-5`}><h3 className="mb-2 font-black">Your invitation link</h3><p className={`mb-3 text-sm ${muted}`}>Anyone with this link can request to connect with you. Only share it with people you trust.</p><div className="flex flex-col gap-2 sm:flex-row"><input readOnly value={inviteLink} className={`min-w-0 flex-1 rounded-xl border px-3 py-3 text-sm ${field}`} /><button onClick={async () => { const copied = await copyTextToClipboard(inviteLink); setNotice(copied ? '✓ INVITE LINK COPIED! Paste it into Messenger or any chat.' : 'Copy was blocked. Select the link field and copy it manually.') }} className={`${buttonPrimary} w-full sm:w-auto`}><Copy className="mr-2" size={17} /> Copy link</button></div><button onClick={() => { const url = `https://www.facebook.com/messages/`; window.open(url, '_blank', 'noopener,noreferrer') }} className={`${buttonSecondary} mt-3`}><Mail className="mr-2" size={17} /> Open Messenger</button></div>}
+        {inviteLink && <div className={`${panel} mt-5 rounded-2xl p-5`}><h3 className="mb-2 font-black">Your invitation link</h3><p className={`mb-3 text-sm ${muted}`}>Anyone with this link can request to connect with you. Only share it with people you trust.</p><div className="flex flex-col gap-2 sm:flex-row"><input readOnly value={inviteLink} className={`min-w-0 flex-1 rounded-xl border px-3 py-3 text-sm ${field}`} /><button onClick={() => { navigator.clipboard?.writeText(inviteLink).then(() => setNotice('Invite link copied!')).catch(() => setNotice('Select and copy the link manually.')) }} className={buttonPrimary}><Copy className="mr-2" size={17} /> Copy</button></div><button onClick={() => { const url = `https://www.facebook.com/messages/`; window.open(url, '_blank', 'noopener,noreferrer') }} className={`${buttonSecondary} mt-3`}><Mail className="mr-2" size={17} /> Open Messenger</button></div>}
         {inviteCode && !inviteLink && <div className={`${panel} mt-5 rounded-2xl p-5`}><div className="flex items-start gap-3"><div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-teal-500/15 text-teal-300"><ShieldCheck size={23} /></div><div className="flex-1"><h3 className="font-black">You've been invited to the Arena!</h3><p className={`my-2 text-sm ${muted}`}>Accept this invitation to connect and unlock a private friends chat.</p><button onClick={acceptInvite} className={buttonPrimary}>Accept invitation <ChevronRight className="ml-1" size={17} /></button></div></div></div>}
         <div className={`${panel} mt-5 rounded-2xl p-5`}><div className="mb-3 flex items-center justify-between gap-3"><h3 className="font-black">Your Arena connections</h3><span className="rounded-full bg-teal-500/15 px-3 py-1 text-xs font-bold text-teal-300">{friends.length} connected</span></div><p className={`text-sm ${muted}`}>Accepted invitations appear in Friends and unlock private chat. During a quiz, the live player list shows who joined that specific game room.</p>{friendRequests.length > 0 && <p className="mt-3 text-sm font-semibold text-amber-300">{friendRequests.length} pending friend request{friendRequests.length === 1 ? '' : 's'} waiting in Friends.</p>}</div>
         <div className={`${panel} mt-5 rounded-2xl p-5`}><h3 className="mb-3 font-black">How it works</h3><div className="grid gap-4 sm:grid-cols-3">{[{ n:'01', title:'Create a link', desc:'Generate a unique invitation.' },{ n:'02', title:'Share it', desc:'Send the link to your friend.' },{ n:'03', title:'Connect & chat', desc:'Accept to unlock private chat.' }].map((item) => <div key={item.n} className="rounded-xl bg-white/[0.03] p-4"><p className="mb-2 text-xs font-black text-teal-300">{item.n}</p><p className="mb-1 font-bold">{item.title}</p><p className={`text-sm ${muted}`}>{item.desc}</p></div>)}</div></div></section>}
@@ -1246,18 +1250,18 @@ export default function App() {
 
     {pendingGameRoom && <div className="fixed inset-0 z-[55] grid place-items-center bg-black/75 p-4 backdrop-blur-sm"><div className={`${panel} w-full max-w-md rounded-3xl p-6`}><div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-teal-500/15 text-teal-300"><Gamepad2 size={28} /></div><p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-teal-300">Game invitation</p><h2 className="mb-2 text-2xl font-black">Join {pendingGameRoom.quiz?.title || 'this quiz'}?</h2><p className={`mb-5 text-sm ${muted}`}>Invited by {pendingGameRoom.creatorName || 'a Quiz Arena player'}. There {pendingGameRoom.players?.length === 1 ? 'is' : 'are'} {pendingGameRoom.players?.length || 1} player{(pendingGameRoom.players?.length || 1) === 1 ? '' : 's'} in this room. Accept to join the waiting lobby. The host starts when everyone is ready.</p><div className="mb-5 flex flex-wrap gap-2">{(pendingGameRoom.players || []).map((player) => <span key={player.uid} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-semibold">{player.name}{player.uid === pendingGameRoom.creatorId ? ' · Host' : ''}</span>)}</div><div className="flex flex-wrap justify-end gap-3"><button onClick={declineGameInvitation} disabled={joiningGame} className={buttonSecondary}>Decline</button><button onClick={acceptGameInvitation} disabled={joiningGame} className={buttonPrimary}>{joiningGame ? 'Joining...' : 'Accept & join game'} <ChevronRight className="ml-1" size={17} /></button></div></div></div>}
 
-    {showCreate && <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain bg-black/85 p-0 backdrop-blur-md sm:p-6"><div className={`${panel} mx-auto min-h-[100dvh] w-full max-w-4xl rounded-none p-4 sm:my-8 sm:min-h-0 sm:rounded-3xl sm:p-7`}>
-      <div className="mb-5 flex items-start justify-between gap-3 sm:mb-7"><div className="min-w-0"><div className="mb-2 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-black uppercase tracking-wider text-cyan-300"><Sparkles size={14} /> Quiz Creator Studio</div><h2 className="text-2xl font-black leading-tight sm:text-3xl">{editingQuiz ? 'Edit your challenge' : 'Build your challenge'}</h2><p className={`mt-2 text-sm ${muted}`}>Create your own questions and choose the answer format.</p></div><button type="button" onClick={closeQuizCreator} className={`rounded-xl p-2 ${muted} hover:bg-white/10`}><X size={22} /></button></div>
-      <form onSubmit={createQuiz} className="space-y-4 sm:space-y-6"><div className="grid gap-4 sm:grid-cols-2"><div className="sm:col-span-2"><label className="mb-2 block text-sm font-bold">Quiz title</label><input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Ultimate IT Knowledge Challenge" maxLength={100} required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /></div></div>
+    {showCreate && <div className="fixed inset-0 z-50 overflow-y-auto bg-black/80 p-3 backdrop-blur-md sm:p-6"><div className={`${panel} mx-auto my-4 max-w-4xl rounded-3xl p-5 sm:my-8 sm:p-7`}>
+      <div className="mb-7 flex items-start justify-between gap-4"><div><div className="mb-3 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1.5 text-xs font-black uppercase tracking-wider text-cyan-300"><Sparkles size={14} /> Quiz Creator Studio</div><h2 className="text-3xl font-black">{editingQuiz ? 'Edit your challenge' : 'Build your challenge'}</h2><p className={`mt-2 text-sm ${muted}`}>Create your own questions and choose the answer format.</p></div><button type="button" onClick={closeQuizCreator} className={`rounded-xl p-2 ${muted} hover:bg-white/10`}><X size={22} /></button></div>
+      <form onSubmit={createQuiz} className="space-y-6"><div className="grid gap-4 sm:grid-cols-2"><div className="sm:col-span-2"><label className="mb-2 block text-sm font-bold">Quiz title</label><input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Ultimate IT Knowledge Challenge" maxLength={100} required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /></div></div>
       <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-black">Questions</h3><p className={`text-xs ${muted}`}>{newQuestions.length} question(s) added</p></div></div>
-      {newQuestions.map((q, qi) => <div key={q.id || qi} className="rounded-2xl border border-cyan-400/20 bg-gradient-to-br from-cyan-500/[0.07] to-violet-500/[0.04] p-3 sm:p-5"><div className="mb-3 flex items-center justify-between gap-2 sm:mb-4"><div className="flex min-w-0 items-center gap-2 sm:gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-500 to-violet-600 font-black text-white">{String(qi + 1).padStart(2, '0')}</span><div><h4 className="font-black">Question {qi + 1}</h4><p className={`text-xs ${muted}`}>Choose question format</p></div></div>{newQuestions.length > 1 && <button type="button" onClick={() => setNewQuestions((prev) => prev.filter((_, i) => i !== qi))} className="rounded-lg p-2 text-rose-400 hover:bg-rose-500/10"><Trash2 size={18} /></button>}</div>
+      {newQuestions.map((q, qi) => <div key={q.id || qi} className="rounded-2xl border border-cyan-400/20 bg-gradient-to-br from-cyan-500/[0.07] to-violet-500/[0.04] p-4 sm:p-5"><div className="mb-4 flex items-center justify-between gap-3"><div className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-cyan-500 to-violet-600 font-black text-white">{String(qi + 1).padStart(2, '0')}</span><div><h4 className="font-black">Question {qi + 1}</h4><p className={`text-xs ${muted}`}>Choose question format</p></div></div>{newQuestions.length > 1 && <button type="button" onClick={() => setNewQuestions((prev) => prev.filter((_, i) => i !== qi))} className="rounded-lg p-2 text-rose-400 hover:bg-rose-500/10"><Trash2 size={18} /></button>}</div>
       <textarea value={q.question} onChange={(e) => updateQuestion(qi, 'question', e.target.value)} placeholder="Type your question here..." rows={2} required className={`mb-4 w-full resize-y rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} />
-      <label className="mb-2 block text-sm font-bold">Question type</label><div className="mb-4 grid grid-cols-1 gap-2 min-[380px]:grid-cols-3 sm:mb-5">{[{value:'multiple',label:'Multiple Choice'},{value:'boolean',label:'True / False'},{value:'identification',label:'Identification'}].map((item) => <button key={item.value} type="button" onClick={() => changeQuestionType(qi, item.value)} className={`rounded-xl border px-2 py-3 text-xs font-black transition sm:text-sm ${q.type === item.value ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300' : 'border-white/10 bg-white/[0.03] hover:border-cyan-400/50'}`}>{item.label}</button>)}</div>
-      {q.type === 'identification' ? <div><label className="mb-2 block text-sm font-bold">Correct answer</label><input value={q.correctText} onChange={(e) => updateQuestion(qi, 'correctText', e.target.value)} placeholder="Enter the exact correct answer" required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /><p className={`mt-2 text-xs ${muted}`}>Answers are checked without case sensitivity and ignore extra spaces.</p></div> : <><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold">{q.type === 'boolean' ? 'Select the correct answer' : 'Answer choices'}</p>{q.type === 'multiple' && <span className="text-xs text-cyan-300">A · B · C only — choose the correct answer</span>}</div><div className="space-y-3">{(q.type === 'multiple' ? q.options.slice(0, 3) : q.options).map((option, oi) => <div key={oi} className="grid grid-cols-[36px_minmax(0,1fr)] gap-2 sm:grid-cols-[40px_minmax(0,1fr)_190px]"><button type="button" onClick={() => updateQuestion(qi, 'correctAnswer', oi)} className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl border font-black ${q.correctAnswer === oi ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300' : 'border-white/10 bg-white/[0.03] text-slate-400'}`} title="Mark as correct answer">{q.correctAnswer === oi ? <Check size={18} /> : String.fromCharCode(65 + oi)}</button><input value={option} onChange={(e) => updateOption(qi, oi, e.target.value)} placeholder={q.type === 'boolean' ? option : `Enter choice ${String.fromCharCode(65 + oi)}`} readOnly={q.type === 'boolean'} required className={`min-w-0 w-full rounded-xl border px-3 py-3 outline-none focus:border-cyan-400 ${field} ${q.type === 'boolean' ? 'opacity-80' : ''}`} />{q.type === 'multiple' && <select value="" onChange={(e) => { const selected = e.target.value; if (selected) updateOption(qi, oi, selected) }} className={`col-start-2 w-full rounded-xl border px-3 py-2 text-xs outline-none focus:border-cyan-400 sm:col-start-auto ${field}`} aria-label={`Choose a previous choice for option ${String.fromCharCode(65 + oi)}`}><option value="">↳ Use a previous choice…</option>{getPreviousChoices(qi).map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>}</div>)}</div>
+      <label className="mb-2 block text-sm font-bold">Question type</label><div className="mb-5 grid grid-cols-3 gap-2">{[{value:'multiple',label:'Multiple Choice'},{value:'boolean',label:'True / False'},{value:'identification',label:'Identification'}].map((item) => <button key={item.value} type="button" onClick={() => changeQuestionType(qi, item.value)} className={`rounded-xl border px-2 py-3 text-xs font-black transition sm:text-sm ${q.type === item.value ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300' : 'border-white/10 bg-white/[0.03] hover:border-cyan-400/50'}`}>{item.label}</button>)}</div>
+      {q.type === 'identification' ? <div><label className="mb-2 block text-sm font-bold">Correct answer</label><input value={q.correctText} onChange={(e) => updateQuestion(qi, 'correctText', e.target.value)} placeholder="Enter the exact correct answer" required className={`w-full rounded-xl border px-4 py-3 outline-none focus:border-cyan-400 ${field}`} /><p className={`mt-2 text-xs ${muted}`}>Answers are checked without case sensitivity and ignore extra spaces.</p></div> : <><div className="mb-3 flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-bold">{q.type === 'boolean' ? 'Select the correct answer' : 'Answer choices'}</p>{q.type === 'multiple' && <span className="text-xs text-cyan-300">A · B · C only — choose the correct answer</span>}</div><div className="space-y-3">{(q.type === 'multiple' ? q.options.slice(0, 3) : q.options).map((option, oi) => <div key={oi} className="grid grid-cols-[40px_minmax(0,1fr)] gap-2 sm:grid-cols-[40px_minmax(0,1fr)_190px]"><button type="button" onClick={() => updateQuestion(qi, 'correctAnswer', oi)} className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl border font-black ${q.correctAnswer === oi ? 'border-emerald-400 bg-emerald-500/20 text-emerald-300' : 'border-white/10 bg-white/[0.03] text-slate-400'}`} title="Mark as correct answer">{q.correctAnswer === oi ? <Check size={18} /> : String.fromCharCode(65 + oi)}</button><input value={option} onChange={(e) => updateOption(qi, oi, e.target.value)} placeholder={q.type === 'boolean' ? option : `Enter choice ${String.fromCharCode(65 + oi)}`} readOnly={q.type === 'boolean'} required className={`min-w-0 w-full rounded-xl border px-3 py-3 outline-none focus:border-cyan-400 ${field} ${q.type === 'boolean' ? 'opacity-80' : ''}`} />{q.type === 'multiple' && <select value="" onChange={(e) => { const selected = e.target.value; if (selected) updateOption(qi, oi, selected) }} className={`col-start-2 w-full rounded-xl border px-3 py-2 text-xs outline-none focus:border-cyan-400 sm:col-start-auto ${field}`} aria-label={`Choose a previous choice for option ${String.fromCharCode(65 + oi)}`}><option value="">↳ Use a previous choice…</option>{getPreviousChoices(qi).map((choice) => <option key={choice} value={choice}>{choice}</option>)}</select>}</div>)}</div>
       </>}
       <div className="mt-4 rounded-xl border border-emerald-400/20 bg-emerald-500/[0.07] p-3 text-xs text-emerald-300"><CheckCircle2 size={14} className="mr-1 inline" /> Correct answer: {q.type === 'identification' ? (q.correctText || 'Not entered') : (q.options[q.correctAnswer] || 'Not selected')}</div></div>)}
-      <div className="sticky bottom-0 z-10 -mx-4 mt-5 flex flex-col gap-2 border-t border-white/10 bg-[#101629]/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-xl sm:static sm:mx-0 sm:mt-0 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:bg-transparent sm:px-0 sm:py-0 sm:pt-5"><button type="button" onClick={() => { rememberChoices(newQuestions.filter((item) => item.type === 'multiple').flatMap((item) => item.options || [])); setNewQuestions((prev) => [...prev, emptyQuestion()]) }} className={`${buttonPrimary} w-full sm:w-auto`}><Plus size={17} className="mr-1" /> Add Question</button><div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:justify-end sm:gap-3"><button type="button" onClick={closeQuizCreator} className={`${buttonSecondary} w-full`}>Cancel</button><button type="submit" disabled={saving} className={`${buttonPrimary} w-full`}>{saving ? 'Saving quiz...' : <><Zap size={17} className="mr-2" /> {editingQuiz ? 'Save Changes' : 'Save Quiz'}</>}</button></div></div></form></div></div>}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-5"><button type="button" onClick={() => { rememberChoices(newQuestions.filter((item) => item.type === 'multiple').flatMap((item) => item.options || [])); setNewQuestions((prev) => [...prev, emptyQuestion()]) }} className={buttonPrimary}><Plus size={17} className="mr-1" /> Add Question</button><div className="flex flex-wrap justify-end gap-3"><button type="button" onClick={closeQuizCreator} className={buttonSecondary}>Cancel</button><button type="submit" disabled={saving} className={buttonPrimary}>{saving ? 'Saving quiz...' : <><Zap size={17} className="mr-2" /> {editingQuiz ? 'Save Changes' : 'Save Quiz'}</>}</button></div></div></form></div></div>}
 
-    {notice && <div role="status" aria-live="polite" className={`fixed bottom-5 left-1/2 z-[60] flex w-[calc(100%-24px)] max-w-[520px] -translate-x-1/2 items-center gap-3 rounded-2xl border px-4 py-3.5 text-sm font-bold text-white shadow-2xl shadow-black/50 ${notice.toLowerCase().includes('copied') ? 'border-emerald-300/40 bg-[#073b32]' : 'border-cyan-300/25 bg-[#211a35]'}`}><CheckCheck className={`shrink-0 ${notice.toLowerCase().includes('copied') ? 'text-emerald-300' : 'text-teal-300'}`} size={20} /><span className="min-w-0 flex-1 break-words">{notice}</span><button onClick={() => setNotice('')} className="shrink-0 rounded-lg p-1 hover:bg-white/10" aria-label="Dismiss notice"><X size={17} /></button></div>}
+    {notice && <div className="fixed bottom-5 left-1/2 z-[60] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-xl border border-white/10 bg-[#211a35] px-5 py-3 text-sm font-semibold text-white shadow-2xl shadow-black/40"><Sparkles className="shrink-0 text-teal-300" size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss notice"><X size={16} /></button></div>}
   </div>
 }
