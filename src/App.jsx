@@ -230,7 +230,7 @@ function cleanForCloud(record) {
   return data
 }
 
-export default function App() {
+function AppContent({ onQuizModeChange }) {
   const [user, setUser] = useState(null)
   const [authReady, setAuthReady] = useState(false)
   const [quizzes, setQuizzes] = useState(initialQuizzes)
@@ -241,6 +241,10 @@ export default function App() {
   const [notice, setNotice] = useState('')
   const [isOnline, setIsOnline] = useState(() => navigator.onLine)
   const [activeQuiz, setActiveQuiz] = useState(null)
+
+  useEffect(() => {
+    onQuizModeChange(Boolean(activeQuiz))
+  }, [activeQuiz, onQuizModeChange])
   const [currentQuestion, setCurrentQuestion] = useState(0)
   const [answers, setAnswers] = useState({})
   const [quizFinished, setQuizFinished] = useState(false)
@@ -1265,3 +1269,73 @@ export default function App() {
     {notice && <div className="fixed bottom-5 left-1/2 z-[60] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-xl border border-white/10 bg-[#211a35] px-5 py-3 text-sm font-semibold text-white shadow-2xl shadow-black/40"><Sparkles className="shrink-0 text-teal-300" size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss notice"><X size={16} /></button></div>}
   </div>
 }
+
+// One persistent music player lives above every screen (Login, Register and Dashboard).
+// The YouTube embed is kept mounted so authentication screen changes do not restart it.
+function ArenaBackgroundMusic({ isQuizActive }) {
+  const iframeRef = useRef(null)
+  const quizActiveRef = useRef(isQuizActive)
+
+  const sendPlayerCommand = useCallback((command) => {
+    const frame = iframeRef.current
+    if (!frame?.contentWindow) return
+    try {
+      frame.contentWindow.postMessage(JSON.stringify({
+        event: 'command',
+        func: command,
+        args: '',
+      }), 'https://www.youtube-nocookie.com')
+    } catch (error) {
+      console.warn('Background music command unavailable:', error)
+    }
+  }, [])
+
+  useEffect(() => {
+    quizActiveRef.current = isQuizActive
+    sendPlayerCommand(isQuizActive ? 'pauseVideo' : 'playVideo')
+  }, [isQuizActive, sendPlayerCommand])
+
+  // Browsers may block audible autoplay. The first normal tap/click anywhere in
+  // the app is used as the permitted user gesture; no extra Play/Pause control.
+  useEffect(() => {
+    const enableAfterFirstGesture = () => {
+      if (!quizActiveRef.current) sendPlayerCommand('playVideo')
+      window.removeEventListener('pointerdown', enableAfterFirstGesture)
+      window.removeEventListener('keydown', enableAfterFirstGesture)
+    }
+    window.addEventListener('pointerdown', enableAfterFirstGesture, { passive: true })
+    window.addEventListener('keydown', enableAfterFirstGesture)
+    return () => {
+      window.removeEventListener('pointerdown', enableAfterFirstGesture)
+      window.removeEventListener('keydown', enableAfterFirstGesture)
+    }
+  }, [sendPlayerCommand])
+
+  return (
+    // Hidden audio source only: no visible YouTube preview, logo, controls, or widget.
+    // Keep the iframe mounted so the track can continue between app screens.
+    <iframe
+      ref={iframeRef}
+      title="Quiz Arena background music"
+      src="https://www.youtube-nocookie.com/embed/E7LVi1AA218?autoplay=1&controls=0&disablekb=1&fs=0&loop=1&playlist=E7LVi1AA218&playsinline=1&enablejsapi=1"
+      aria-hidden="true"
+      tabIndex={-1}
+      className="pointer-events-none fixed -left-[10000px] -top-[10000px] h-[200px] w-[200px] border-0 opacity-0"
+      allow="autoplay; encrypted-media"
+      referrerPolicy="strict-origin-when-cross-origin"
+    />
+  )
+}
+
+export default function App() {
+  const [isQuizActive, setIsQuizActive] = useState(false)
+  const updateQuizMode = useCallback((active) => setIsQuizActive(active), [])
+
+  return (
+    <>
+      <ArenaBackgroundMusic isQuizActive={isQuizActive} />
+      <AppContent onQuizModeChange={updateQuizMode} />
+    </>
+  )
+}
+
