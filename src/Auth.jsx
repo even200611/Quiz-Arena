@@ -205,7 +205,7 @@ export default function Auth({ onLogin }) {
             <p className="mt-2 text-sm text-slate-400">Challenge your mind. Play anywhere.</p>
           </div>
 
-          <div className="rounded-3xl border border-white/10 bg-[#111626]/95 p-6 shadow-2xl shadow-black/50 backdrop-blur-xl sm:p-8">
+          <div className="w-full min-w-0 rounded-3xl border border-white/10 bg-[#111626]/95 p-5 shadow-2xl shadow-black/50 backdrop-blur-xl sm:p-8">
             <div className="mb-7">
               <div className="mb-3 flex items-center justify-between gap-2">
                 <span className="text-xs font-bold uppercase tracking-[0.2em] text-violet-400">Player Access</span>
@@ -243,7 +243,7 @@ export default function Auth({ onLogin }) {
                 <label className="mb-2 block text-sm font-semibold text-slate-300">Email address</label>
                 <div className="group flex items-center gap-3 rounded-xl border border-white/10 bg-[#090e1b] px-4 transition focus-within:border-violet-500 focus-within:ring-2 focus-within:ring-violet-500/10">
                   <Mail size={18} className="text-slate-500 group-focus-within:text-violet-400" />
-                  <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" required className="w-full bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
+                  <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" autoCapitalize="none" spellCheck={false} required className="w-full min-w-0 bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
                 </div>
               </div>
 
@@ -251,7 +251,7 @@ export default function Auth({ onLogin }) {
                 <label className="mb-2 block text-sm font-semibold text-slate-300">Password</label>
                 <div className="group flex items-center gap-3 rounded-xl border border-white/10 bg-[#090e1b] px-4 transition focus-within:border-violet-500 focus-within:ring-2 focus-within:ring-violet-500/10">
                   <LockKeyhole size={18} className="text-slate-500 group-focus-within:text-violet-400" />
-                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === 'register' ? 'Create a strong password' : 'Enter your password'} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} minLength={mode === 'register' ? 8 : 6} required className="w-full bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
+                  <input type={showPassword ? 'text' : 'password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === 'register' ? 'Create a strong password' : 'Enter your password'} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} minLength={mode === 'register' ? 8 : 6} required className="w-full min-w-0 bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
                   <button type="button" onClick={() => setShowPassword(!showPassword)} className="text-slate-500 transition hover:text-white" aria-label={showPassword ? 'Hide password' : 'Show password'}>
                     {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                   </button>
@@ -274,7 +274,7 @@ export default function Auth({ onLogin }) {
                   <label className="mb-2 block text-sm font-semibold text-slate-300">Confirm password</label>
                   <div className="group flex items-center gap-3 rounded-xl border border-white/10 bg-[#090e1b] px-4 transition focus-within:border-violet-500 focus-within:ring-2 focus-within:ring-violet-500/10">
                     <LockKeyhole size={18} className="text-slate-500 group-focus-within:text-violet-400" />
-                    <input type={showConfirmPassword ? 'text' : 'password'} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="Enter your password again" autoComplete="new-password" required className="w-full bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
+                    <input type={showConfirmPassword ? 'text' : 'password'} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="Enter your password again" autoComplete="new-password" required className="w-full min-w-0 bg-transparent py-3.5 text-sm outline-none placeholder:text-slate-600" />
                     <button type="button" onClick={() => setShowConfirmPassword(!showConfirmPassword)} className="text-slate-500 transition hover:text-white" aria-label={showConfirmPassword ? 'Hide password' : 'Show password'}>
                       {showConfirmPassword ? <EyeOff size={18} /> : <Eye size={18} />}
                     </button>
@@ -283,7 +283,7 @@ export default function Auth({ onLogin }) {
                 </div>
               )}
 
-              {error && <div role="alert" className="flex items-start gap-2 rounded-xl border border-red-500/20 bg-red-500/10 p-3 text-sm leading-5 text-red-300"><CircleAlert size={18} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
+              {error && <div role="alert" aria-live="polite" className="flex items-start gap-2 rounded-xl border border-red-500/20 bg-red-500/10 p-3 text-sm leading-5 text-red-300"><CircleAlert size={18} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
 
               <button type="submit" disabled={loading} className="group flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 py-4 font-bold shadow-lg shadow-violet-900/30 transition-all hover:-translate-y-0.5 hover:from-violet-500 hover:to-fuchsia-500 disabled:cursor-not-allowed disabled:opacity-60">
                 {loading ? <><LoaderCircle size={19} className="animate-spin" /> Please wait...</> : <>{mode === 'login' ? 'Enter the Arena' : 'Create My Account'}<ArrowRight size={18} className="transition-transform group-hover:translate-x-1" /></>}
@@ -298,7 +298,7 @@ export default function Auth({ onLogin }) {
 
             <div className="my-6 flex items-center gap-3"><div className="h-px flex-1 bg-white/10" /><span className="text-[10px] font-bold tracking-[0.2em] text-slate-600">OR PLAY WITHOUT AN ACCOUNT</span><div className="h-px flex-1 bg-white/10" /></div>
 
-            <button type="button" onClick={handleGuest} disabled={loading} className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-400/25 bg-violet-500/10 py-3.5 text-sm font-bold text-white transition hover:border-violet-400/60 hover:bg-violet-500/20">
+            <button type="button" onClick={handleGuest} disabled={loading} className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-400/25 bg-violet-500/10 py-3.5 text-sm font-bold text-white transition duration-200 hover:-translate-y-0.5 hover:border-violet-400/60 hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-60">
               <UserRoundPlus size={18} className="text-violet-300" />
               Continue as Guest — Offline
             </button>
