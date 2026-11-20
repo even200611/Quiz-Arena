@@ -519,7 +519,7 @@ function AppContent({ onQuizModeChange }) {
 
       if (user.isLocalGuest || user.isOfflineAccount || !navigator.onLine) return
       try {
-        const snapshot = await getDocs(collection(db, 'quizzes'))
+        const snapshot = await getDocs(query(collection(db, 'quizzes'), where('createdBy', '==', user.uid)))
         const deletedQuizzes = await getDeletedLocalQuizzes(user.uid)
         const deletedIds = new Set(deletedQuizzes.flatMap((item) => [item.quizId, item.localId]).filter(Boolean))
         const saved = snapshot.docs.map((item) => ({ id: item.id, ...item.data() })).filter((item) => !item.deleted && !deletedIds.has(item.id) && !deletedIds.has(item.localId))
